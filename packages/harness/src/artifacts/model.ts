@@ -30,6 +30,7 @@ export type KnownArtifactCapability =
   | "outline"
   | "search"
   | "select"
+  | "steer"
   | "thumbnail"
   | "validate"
   | "zoom";
@@ -81,6 +82,16 @@ export interface ArtifactBuildReference {
   snapshotUri: string;
 }
 
+export interface ArtifactInteractionReference {
+  /** Mutable resolver for the shared-work state of this exact revision. */
+  workspaceUri: string;
+}
+
+export interface ArtifactIntentReference {
+  /** Host-minted admission endpoint for this exact Artifact surface binding. */
+  intentUri: string;
+}
+
 export interface ArtifactDescriptor {
   id: string;
   /**
@@ -98,6 +109,8 @@ export interface ArtifactDescriptor {
   revision: ArtifactRevisionReference;
   adapter: ArtifactAdapterReference;
   build?: ArtifactBuildReference;
+  intent?: ArtifactIntentReference;
+  interaction?: ArtifactInteractionReference;
   renderer: ArtifactRendererReference;
   capabilities: ArtifactCapability[];
 }
@@ -497,6 +510,18 @@ export interface ArtifactBuildDiagnostic {
   column?: number;
 }
 
+export interface AgentReactBuildMetadata {
+  protocolVersion: "agent-react/1";
+  artifactDigest: ArtifactDigest;
+  buildDigest: ArtifactDigest;
+  buildPolicyDigest: ArtifactDigest;
+  view: {
+    id: string;
+    state: readonly { path: string; schema: string; version: number }[];
+    capabilities: readonly string[];
+  };
+}
+
 /** Immutable result of compiling one code-backed Artifact project. */
 export interface ArtifactBuildSnapshot {
   kind: typeof ARTIFACT_BUILD_SNAPSHOT_KIND;
@@ -511,6 +536,8 @@ export interface ArtifactBuildSnapshot {
   };
   previewUri?: string;
   diagnostics: ArtifactBuildDiagnostic[];
+  /** Present only for builds admitted by the AgentReact production profile. */
+  agentReact?: AgentReactBuildMetadata;
 }
 
 const ARTIFACT_FAMILIES = new Set<ArtifactFamily>(["documents", "images-diagrams", "data", "source-text", "other"]);
@@ -872,12 +899,34 @@ export function isArtifactBuildSnapshot(value: unknown): value is ArtifactBuildS
     || typeof value.runtime.version !== "string") return false;
   if (value.previewUri !== undefined && !isStudioArtifactPath(value.previewUri)) return false;
   if (value.status === "ready" && value.previewUri === undefined) return false;
+  if (value.agentReact !== undefined && !isAgentReactBuildMetadata(value.agentReact)) return false;
   return Array.isArray(value.diagnostics) && value.diagnostics.every((diagnostic) => isRecord(diagnostic)
     && (diagnostic.level === "warning" || diagnostic.level === "error")
     && typeof diagnostic.message === "string"
     && (diagnostic.source === undefined || typeof diagnostic.source === "string")
     && (diagnostic.line === undefined || typeof diagnostic.line === "number")
     && (diagnostic.column === undefined || typeof diagnostic.column === "number"));
+}
+
+function isAgentReactBuildMetadata(value: unknown): value is AgentReactBuildMetadata {
+  if (!isRecord(value)
+    || value.protocolVersion !== "agent-react/1"
+    || !isDigest(value.artifactDigest)
+    || !isDigest(value.buildDigest)
+    || !isDigest(value.buildPolicyDigest)
+    || !isRecord(value.view)
+    || typeof value.view.id !== "string"
+    || value.view.id === ""
+    || !Array.isArray(value.view.state)
+    || !Array.isArray(value.view.capabilities)) return false;
+  return value.view.state.every((entry) => isRecord(entry)
+    && typeof entry.path === "string"
+    && entry.path.startsWith("/")
+    && typeof entry.schema === "string"
+    && entry.schema !== ""
+    && Number.isSafeInteger(entry.version)
+    && Number(entry.version) > 0)
+    && value.view.capabilities.every((capability) => typeof capability === "string" && capability !== "");
 }
 
 function isArtifactDescriptor(value: unknown): value is ArtifactDescriptor {
@@ -892,6 +941,8 @@ function isArtifactDescriptor(value: unknown): value is ArtifactDescriptor {
     && isRevision(value.revision)
     && isAdapter(value.adapter)
     && (value.build === undefined || (isRecord(value.build) && isStudioArtifactPath(value.build.snapshotUri)))
+    && (value.intent === undefined || (isRecord(value.intent) && isStudioArtifactPath(value.intent.intentUri)))
+    && (value.interaction === undefined || (isRecord(value.interaction) && isStudioArtifactPath(value.interaction.workspaceUri)))
     && (value.backing !== "code" || value.build !== undefined)
     && isRenderer(value.renderer)
     && Array.isArray(value.capabilities)

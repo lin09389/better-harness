@@ -410,6 +410,106 @@ function inferModelUsage(raw) {
   return observed ? usage : null;
 }
 
+function inferContextUsageRatio(raw) {
+  const value = Number(raw?.message?.usage?.context_usage_ratio ?? raw?.data?.message?.usage?.context_usage_ratio);
+  return Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+}
+
+function inferContextWindowTokens(raw) {
+  const value = Number(raw?.contextWindow ?? raw?.data?.contextWindow);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function enrichQoderContextUsage(events) {
+  const observedWindows = [...new Set(events.map((event) => event.observedContextWindowTokens)
+    .filter((value) => Number.isFinite(value) && value > 0))];
+  const sessionWindow = observedWindows.length === 1 ? observedWindows[0] : null;
+  let currentWindow = sessionWindow;
+  const enriched = events.map((event) => {
+    if (Number.isFinite(event.observedContextWindowTokens) && event.observedContextWindowTokens > 0) {
+      currentWindow = event.observedContextWindowTokens;
+    }
+    const context = event.currentContextUsage;
+    if (!context || !Number.isFinite(context.percentFull)) return event;
+    const windowTokens = Number.isFinite(context.windowTokens) && context.windowTokens > 0
+      ? context.windowTokens
+      : currentWindow;
+    return {
+      ...event,
+      currentContextUsage: {
+        ...context,
+        ...(Number.isFinite(windowTokens) && windowTokens > 0 ? {
+          usedTokens: Math.round((context.percentFull / 100) * windowTokens),
+          windowTokens: Math.round(windowTokens),
+        } : {}),
+      },
+    };
+  });
+  return mergeQoderAssistantContextIntoResponses(enriched);
+}
+
+const QODER_CONTEXT_MERGE_MAX_GAP_MS = 1_000;
+
+function sameObservedValue(left, right) {
+  return !left || !right || left === right;
+}
+
+/**
+ * Qoder retains one inference in parallel logs-session and project-jsonl
+ * lanes. The logs lane owns the canonical `model.response.completed` event;
+ * the project lane may add the context ratio a few milliseconds later. Merge
+ * that evidence one-to-one instead of presenting both lanes as model calls.
+ *
+ * Unmatched assistant context is intentionally preserved on its original
+ * event: it can still describe Session-current occupancy, but the shared usage
+ * progression accepts canonical model responses only.
+ */
+export function mergeQoderAssistantContextIntoResponses(events, {
+  maxGapMs = QODER_CONTEXT_MERGE_MAX_GAP_MS,
+} = {}) {
+  const merged = events.map((event) => event);
+  const availableResponses = new Set(events
+    .map((event, index) => event?.type === "model.response.completed" ? index : null)
+    .filter((index) => index !== null));
+
+  for (const assistant of events) {
+    if (assistant?.type !== "assistant" || !assistant.currentContextUsage) continue;
+    const assistantTime = timestampMillis(assistant.timestamp);
+    if (assistantTime === null) continue;
+    let matchIndex = null;
+    let matchGap = Number.POSITIVE_INFINITY;
+    for (const index of availableResponses) {
+      const response = merged[index];
+      if (!sameObservedValue(response?.sessionId, assistant.sessionId)
+        || !sameObservedValue(response?.model, assistant.model)
+        || !sameObservedValue(response?.stopReason, assistant.stopReason)) continue;
+      const responseTime = timestampMillis(response.timestamp);
+      if (responseTime === null) continue;
+      const gap = assistantTime - responseTime;
+      if (gap < 0 || gap > maxGapMs || gap >= matchGap) continue;
+      matchIndex = index;
+      matchGap = gap;
+    }
+    if (matchIndex === null) continue;
+    const response = merged[matchIndex];
+    merged[matchIndex] = {
+      ...response,
+      currentContextUsage: {
+        ...assistant.currentContextUsage,
+        ...(response.currentContextUsage ?? {}),
+      },
+    };
+    availableResponses.delete(matchIndex);
+  }
+  return merged.map((event) => {
+    const carriesUsageEvidence = event?.modelUsage || event?.modelInvocationUsage
+      || event?.currentContextUsage || Number.isFinite(event?.processedTokens);
+    return event?.type !== "model.response.completed" && carriesUsageEvidence
+      ? { ...event, usageProgressionExcluded: true }
+      : event;
+  });
+}
+
 function inferCwd(raw) {
   return raw?.cwd ?? raw?.data?.cwd ?? raw?.workspace ?? raw?.data?.workspace ?? null;
 }
@@ -1447,6 +1547,8 @@ export class QoderSessionAnalyzer extends SessionAnalyzer {
     const stopReason = inferStopReason(raw);
     const isSubagent = inferIsSubagent(raw);
     const modelUsage = inferModelUsage(raw);
+    const contextUsageRatio = inferContextUsageRatio(raw);
+    const contextWindowTokens = inferContextWindowTokens(raw);
     const cwd = inferCwd(raw);
     const phase = lifecyclePhase(type);
     const auditLifecycle = isAuditLifecycle(sourceRef.kind);
@@ -1512,7 +1614,26 @@ export class QoderSessionAnalyzer extends SessionAnalyzer {
     }
     if (modelUsage) {
       event.modelUsage = modelUsage;
+      event.modelInvocationUsage = modelUsage;
       event.usageFieldsObserved = true;
+      event.usageBasis = "model-inference";
+      event.usageSource = "qoder-project-transcript";
+    }
+    if (contextUsageRatio !== null) {
+      event.currentContextUsage = {
+        // Keep enough provider precision to derive an absolute token count when
+        // a real session window is also retained. Presentation layers round it.
+        percentFull: contextUsageRatio * 100,
+        basis: "host-context-ratio",
+        source: "qoder-project-context-ratio",
+        rawTextOmitted: true,
+      };
+    }
+    if (contextWindowTokens !== null) {
+      event.observedContextWindowTokens = contextWindowTokens;
+    }
+    if (raw?.compactMetadata && typeof raw.compactMetadata === "object") {
+      event.compactionBoundary = true;
     }
     if (cwd) {
       event.cwd = cwd;
@@ -1681,7 +1802,7 @@ export class QoderSessionAnalyzer extends SessionAnalyzer {
         }
         return (a.evidenceRef.line ?? a.evidenceRef.seq ?? 0) - (b.evidenceRef.line ?? b.evidenceRef.seq ?? 0);
       });
-    return markSessionReadCoverage(sorted, { truncated });
+    return markSessionReadCoverage(enrichQoderContextUsage(sorted), { truncated });
   }
 
   async readJsonlEvents(sessionId, scope, ref, events, options, { workspaceLinked = false } = {}) {

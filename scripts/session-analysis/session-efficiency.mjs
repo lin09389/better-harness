@@ -4,6 +4,7 @@ import { buildDailyUsageActivity } from "./daily-usage.mjs";
 import { privacySafeUserInputSummary } from "./privacy-safe-text.mjs";
 import { sessionAnalysisRef } from "./session-ref.mjs";
 import { buildToolCallTrace } from "./tool-call-trace.mjs";
+import { responseIdentityKeys } from "./usage-records.mjs";
 
 export const SESSION_EFFICIENCY_SCHEMA_VERSION = 1;
 
@@ -222,14 +223,6 @@ function deduplicateModelRequests(events) {
     addTimeBucket(output[index], index, timeBuckets);
   }
   return output;
-}
-
-function responseIdentityKeys(event) {
-  const session = event?.sessionId ?? "unknown";
-  return [
-    event?.responseId ? `${session}:response:${event.responseId}` : null,
-    event?.requestId ? `${session}:request:${event.requestId}` : null,
-  ].filter(Boolean);
 }
 
 function responseTimestamp(event) {

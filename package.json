@@ -1,6 +1,6 @@
 {
   "name": "@qoder-ai/better-harness",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "Build an AI-ready engineering system for safe coding-agent delivery and continuous software improvement.",
   "license": "MIT",
   "author": {
@@ -93,7 +93,7 @@
     "harness-studio:dev": "npm run dev -w @qoder-ai/harness-studio --",
     "harness-studio:test": "npm test -w @qoder-ai/harness-studio",
     "harness-studio:test:browser": "npm run test:browser -w @qoder-ai/harness-studio",
-    "inspector": "node scripts/harness-inspector/cli.mjs render",
+    "inspector": "node scripts/harness-inspector/cli.mjs",
     "inspector:open": "node scripts/harness-inspector/cli.mjs render --open",
     "inspector:visual-check": "node scripts/harness-inspector/visual-contract-check.mjs",
     "pack:verify": "node scripts/npm-package/verify-pack.mjs",

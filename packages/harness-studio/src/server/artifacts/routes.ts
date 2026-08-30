@@ -233,7 +233,7 @@ async function resolveArtifactRevision(
   }
   return { entry, index };
 }
-async function resolveArtifactRevisionPlugin(
+export async function resolveArtifactRevisionPlugin(
   options: HarnessStudioServerOptions,
   id: string,
   revision: string,
@@ -555,7 +555,7 @@ export async function serveArtifactSnapshotResource(
     respondArtifactJson(response, 422, { error: safeArtifactError(error) });
   }
 }
-function safeArtifactError(error: unknown): string {
+export function safeArtifactError(error: unknown): string {
   const message = error instanceof Error && error.message !== "" ? error.message : "Artifact adaptation failed.";
   return message.replaceAll(process.cwd(), "<workspace>").slice(0, 1_000);
 }
@@ -600,7 +600,7 @@ export async function serveArtifactHostedDocument(
     response.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; worker-src blob:;",
+      "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'self'; worker-src blob:;",
       "X-Content-Type-Options": "nosniff",
     });
     response.end(html);

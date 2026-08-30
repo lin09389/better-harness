@@ -18,6 +18,7 @@ import {
   renderHarnessInspectorHtml,
 } from "../../scripts/harness-inspector/index.mjs";
 import { summarizeSessionEvents } from "../../scripts/commit-session-link/index.mjs";
+import { buildUsageReport } from "../../scripts/session-analysis/index.mjs";
 
 const CLI_PATH = fileURLToPath(new URL("../../scripts/harness-inspector/cli.mjs", import.meta.url));
 
@@ -200,6 +201,19 @@ function scriptBody(html, openingTag) {
   const closing = html.indexOf("</script>", contentStart);
   assert.notEqual(closing, -1, `missing closing script tag for ${openingTag}`);
   return html.slice(contentStart, closing);
+}
+
+function calendarGridMarkup(html, month) {
+  const marker = `data-calendar-month="${month}"`;
+  const markerIndex = html.indexOf(marker);
+  assert.notEqual(markerIndex, -1, `missing calendar month ${month}`);
+  const opening = html.lastIndexOf('<div class="date-grid"', markerIndex);
+  const contentStart = html.indexOf(">", markerIndex) + 1;
+  const closing = html.indexOf("</div>", contentStart);
+  return {
+    openingTag: html.slice(opening, contentStart),
+    body: html.slice(contentStart, closing),
+  };
 }
 
 test("feature-tree parser builds typed hierarchy and refs (AC-1)", () => {
@@ -442,6 +456,51 @@ test("Inspector serializes one self-contained executable report document (AC-2, 
   assert.doesNotThrow(() => new Function(clientScript));
 });
 
+test("Inspector Date picker renders the latest evidence month as a complete UTC month (AC-3)", () => {
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession()],
+    correlation: fixtureCorrelation(),
+    filters: { platform: "codex" },
+  });
+  const html = renderHarnessInspectorHtml(report);
+  const august = calendarGridMarkup(html, "2026-08");
+
+  assert.doesNotMatch(august.openingTag, /\shidden(?:\s|>)/u);
+  assert.equal([...august.body.matchAll(/class="date-cell/gu)].length, 42);
+  assert.match(august.body, /^<span class="date-cell empty outside"[^>]*><time datetime="2026-07-27">27<\/time>/u);
+  assert.match(august.body, /<span class="date-cell empty outside"[^>]*><time datetime="2026-09-06">6<\/time><\/span>$/u);
+  assert.match(august.body, /<span class="date-cell empty"[^>]*><time datetime="2026-08-13">13<\/time>/u);
+  assert.match(html, /aria-label="Previous month" disabled/u);
+  assert.match(html, /aria-label="Next month" disabled/u);
+});
+
+test("Inspector Date picker keeps cross-year evidence reachable one month at a time (AC-3)", () => {
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession()],
+    correlation: fixtureCorrelation(),
+    filters: { platform: "codex" },
+  });
+  report.days = [
+    { date: "2026-12-31", sessionIds: ["session-a"], commitHashes: [], promptCount: 1, toolCallCount: 0 },
+    { date: "2027-01-01", sessionIds: ["session-a"], commitHashes: [], promptCount: 0, toolCallCount: 1 },
+  ];
+  const html = renderHarnessInspectorHtml(report);
+  const december = calendarGridMarkup(html, "2026-12");
+  const january = calendarGridMarkup(html, "2027-01");
+
+  assert.match(december.openingTag, /\shidden>/u);
+  assert.doesNotMatch(january.openingTag, /\shidden(?:\s|>)/u);
+  assert.match(html, /data-calendar-label>January 2027<\/strong>/u);
+  assert.match(html, /aria-label="Previous month">/u);
+  assert.match(html, /aria-label="Next month" disabled/u);
+  assert.equal([...december.body.matchAll(/class="date-cell/gu)].length % 7, 0);
+  assert.equal([...january.body.matchAll(/class="date-cell/gu)].length % 7, 0);
+});
+
 // Chrome copy is asserted through the elements that own it: the sidebar owns
 // workspace identity, the breadcrumb owns the selected scope, and the tablist
 // names what a reader browses by.
@@ -572,6 +631,503 @@ test("Inspector final HTML redacts credentials and omits absolute roots (AC-7)",
   assert.doesNotMatch(html, /C:\\\\Users\\\\private/u);
   assert.match(html, /&lt;redacted&gt;|\\u003credacted>/u);
   assert.match(html, /absolute-path/u);
+});
+
+test("Inspector projects usage and context metadata without raw context text", () => {
+  const secret = "private-system-context-fixture";
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession({
+      dialogue: {
+        truncated: false,
+        turns: [{
+          index: 1,
+          prompt: { text: "Inspect usage", timestamp: "2026-08-12T08:00:00.000Z" },
+          steps: [{
+            kind: "usage",
+            tokenUsage: { inputTokens: 90, outputTokens: 8, totalTokens: 98, raw: secret },
+            cacheReuse: {
+              status: "observed",
+              accountingMode: "included-in-input",
+              cacheReadTokens: 45,
+              promptInputTokens: 90,
+              uncachedInputTokens: 45,
+              reusePercent: 50,
+              raw: secret,
+            },
+            contextUsage: { usedTokens: 25, windowTokens: 100, percentFull: 25, raw: secret },
+            source: "fixture-response-usage",
+            raw: secret,
+          }],
+          usageEventCount: 1,
+          eventCount: 1,
+          shownEventCount: 1,
+          toolCallCount: 0,
+          response: "Measured.",
+          responseStatus: "retained",
+        }],
+      },
+      tokenUsage: {
+        inputTokens: 180,
+        outputTokens: 18,
+        cacheReadInputTokens: 90,
+        cacheCreationInputTokens: 5,
+        reasoningOutputTokens: 6,
+        totalTokens: 198,
+        basis: "model-inference",
+        source: "codex-rollout-token-count",
+        coverage: "observed",
+        cacheAccountingMode: "included-in-input",
+        raw: secret,
+      },
+      runtime: { modelProvider: "openai", cliVersion: "fixture-cli", effort: "high", raw: secret },
+      timestampBasis: "native-event",
+      contextManifest: {
+        status: "observed",
+        source: "codex-rollout-token-count",
+        rawTextOmitted: false,
+        usedTokens: 25,
+        windowTokens: 100,
+        percentFull: 25,
+        compactionCount: 1,
+        layers: [
+          { kind: "developer-message", itemCount: 2, text: secret },
+          { kind: "skills", itemCount: 1, text: secret },
+        ],
+        categories: [{ kind: "rules", label: "Rules", estimatedTokens: 10, text: secret }],
+        rawText: secret,
+      },
+    })],
+    correlation: fixtureCorrelation(),
+  });
+  const session = report.sessions[0];
+  assert.deepEqual(session.tokenUsage, {
+    inputTokens: 180,
+    outputTokens: 18,
+    cacheReadInputTokens: 90,
+    cacheCreationInputTokens: 5,
+    reasoningOutputTokens: 6,
+    totalTokens: 198,
+    basis: "model-inference",
+    source: "codex-rollout-token-count",
+    coverage: "observed",
+    cacheAccountingMode: "included-in-input",
+  });
+  assert.deepEqual(session.cacheReuse, {
+    status: "observed",
+    accountingMode: "included-in-input",
+    cacheReadTokens: 90,
+    cacheCreationTokens: 5,
+    promptInputTokens: 180,
+    uncachedInputTokens: 90,
+    reusePercent: 50,
+  });
+  assert.deepEqual(session.runtime, { modelProvider: "openai", cliVersion: "fixture-cli", effort: "high" });
+  assert.deepEqual(session.contextManifest, {
+    status: "observed",
+    source: "codex-rollout-token-count",
+    rawTextOmitted: true,
+    compactionCount: 1,
+    layers: [
+      { kind: "developer-message", itemCount: 2 },
+      { kind: "skills", itemCount: 1 },
+    ],
+    categories: [{ kind: "rules", label: "Rules", estimatedTokens: 10 }],
+    usedTokens: 25,
+    windowTokens: 100,
+    percentFull: 25,
+  });
+  assert.deepEqual(session.dialogue.turns[0].steps[0], {
+    kind: "usage",
+    tokenUsage: { inputTokens: 90, outputTokens: 8, totalTokens: 98 },
+    cacheReuse: {
+      status: "observed",
+      accountingMode: "included-in-input",
+      cacheReadTokens: 45,
+      promptInputTokens: 90,
+      uncachedInputTokens: 45,
+      reusePercent: 50,
+    },
+    contextUsage: { usedTokens: 25, windowTokens: 100, percentFull: 25 },
+    source: "fixture-response-usage",
+    timestamp: null,
+  });
+  const html = renderHarnessInspectorHtml(report);
+  assert.match(html, /Usage and context/u);
+  assert.match(html, /View report/u);
+  assert.doesNotMatch(html, /<h3>Usage and Context Report<\/h3>/u);
+  assert.match(html, /<h3 class="visually-hidden">Usage report<\/h3>/u);
+  assert.doesNotMatch(html, /<span class="usage-report-kicker">/u);
+  assert.doesNotMatch(html, /<p>Unique model responses, absolute context progression/u);
+  assert.match(html, /Input reuse/u);
+  assert.match(html, /usage-report-reuse-tile/u);
+  assert.doesNotMatch(html, /<h4>Current context composition<\/h4>/u);
+  assert.match(html, /Total input \(includes cached\)/u);
+  assert.match(html, /Raw context/u);
+  assert.match(html, /data-session-mode-panel="usage"/u);
+  assert.match(html, /Model response/u);
+  assert.doesNotMatch(html, new RegExp(secret, "u"));
+});
+
+test("Inspector projects the derived Usage report instead of recounting the bounded dialogue (AC-20/AC-21)", () => {
+  const observation = (model, contextTokens, processedTokens, outputTokens) => ({
+    model,
+    contextTokens,
+    processedTokens,
+    processedTokensBasis: "derived-accounted-usage",
+    outputTokens,
+  });
+  const usageStep = (model, contextTokens, processedTokens, outputTokens) => ({
+    kind: "usage",
+    model,
+    tokenUsage: { inputTokens: 1, outputTokens, cacheReadInputTokens: contextTokens - 6, cacheCreationInputTokens: 5 },
+    contextUsage: { usedTokens: contextTokens, basis: "prompt-tokens" },
+    processedTokens,
+    processedTokensBasis: "derived-accounted-usage",
+    source: "claude-project-transcript",
+  });
+  const observations = [
+    observation("claude-opus", 100, 112, 12),
+    observation("claude-opus", 125, 132, 7),
+    observation("claude-opus", 120, 126, 6),
+    observation("claude-sonnet", 80, 90, 10),
+    observation("claude-sonnet", 80, 85, 5),
+  ];
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession({
+      platform: "claude",
+      models: ["claude-opus", "claude-sonnet"],
+      usageReport: buildUsageReport(observations, {
+        diagnostics: { duplicateRecordsCollapsed: 3, conflictingDuplicateRecords: 1 },
+      }),
+      tokenUsage: {
+        inputTokens: 5,
+        outputTokens: 42,
+        cacheReadInputTokens: 475,
+        cacheCreationInputTokens: 25,
+        basis: "model-inference",
+        source: "claude-project-transcript",
+        coverage: "observed",
+      },
+      contextManifest: {
+        status: "partial",
+        source: "claude-project-transcript",
+        usedTokens: 80,
+        basis: "prompt-tokens",
+        compactionCount: 0,
+        layers: [],
+        categories: [],
+      },
+      // Session View retains only part of a long turn. The report must still
+      // quote the Session's real call count, not what the dialogue shows.
+      dialogue: {
+        truncated: false,
+        turns: [{
+          index: 1,
+          prompt: { text: "Inspect Claude usage", timestamp: "2026-08-12T08:00:00.000Z" },
+          steps: [usageStep("claude-opus", 100, 112, 12), usageStep("claude-opus", 125, 132, 7)],
+          usageEventCount: 5,
+          eventCount: 5,
+          shownEventCount: 2,
+          toolCallCount: 0,
+          response: "Measured.",
+          responseStatus: "retained",
+        }],
+      },
+    })],
+    correlation: fixtureCorrelation(),
+  });
+
+  assert.deepEqual(report.sessions[0].usageReport, {
+    actualModelCalls: 5,
+    duplicateRecordsCollapsed: 3,
+    conflictingDuplicateRecords: 1,
+    currentContextTokens: 80,
+    baselineContextTokens: 100,
+    contextResetCount: 1,
+    modelBoundaryCount: 1,
+    processedTokens: 545,
+    processedTokensBasis: "derived-accounted-usage",
+    processedCoverage: "observed",
+    progressionTotalCount: 5,
+    progressionTruncated: false,
+    progression: [
+      { id: "R1", index: 1, model: "claude-opus", contextTokens: 100, processedTokens: 112, outputTokens: 12, boundary: "baseline" },
+      { id: "R2", index: 2, model: "claude-opus", contextTokens: 125, contextDeltaTokens: 25, processedTokens: 132, outputTokens: 7, boundary: "growth" },
+      { id: "R3", index: 3, model: "claude-opus", contextTokens: 120, contextDeltaTokens: -5, processedTokens: 126, outputTokens: 6, boundary: "shrink" },
+      { id: "R4", index: 4, model: "claude-sonnet", contextTokens: 80, processedTokens: 90, outputTokens: 10, boundary: "model-change" },
+      { id: "R5", index: 5, model: "claude-sonnet", contextTokens: 80, contextDeltaTokens: 0, processedTokens: 85, outputTokens: 5, boundary: "steady" },
+    ],
+  });
+  assert.equal(Object.hasOwn(report.sessions[0].usageReport, "netContextDeltaTokens"), false);
+  assert.equal(Object.hasOwn(report.sessions[0].usageReport, "providerTotalTokens"), false);
+  assert.equal(Object.hasOwn(report.sessions[0], "usageDiagnostics"), false);
+});
+
+test("Inspector links Usage points to prompts only through observed Turn time windows (AC-30)", () => {
+  const usageReport = buildUsageReport([
+    { model: "gpt-5.6", contextTokens: 100, timestamp: "2026-08-12T08:02:00.000Z" },
+    { model: "gpt-5.6", contextTokens: 120, timestamp: "2026-08-12T08:07:00.000Z" },
+    { model: "gpt-5.6", contextTokens: 140, timestamp: "2026-08-12T08:12:00.000Z" },
+    { model: "gpt-5.6", contextTokens: 160, timestamp: "2026-08-12T08:14:00.000Z" },
+  ]);
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession({
+      usageReport,
+      dialogue: {
+        truncated: false,
+        turns: [
+          {
+            index: 1,
+            prompt: { text: "Inspect context pressure", timestamp: "2026-08-12T08:00:00.000Z" },
+            steps: [],
+            response: "Measured the first interval.",
+            startMs: Date.parse("2026-08-12T08:00:00.000Z"),
+            endMs: Date.parse("2026-08-12T08:05:00.000Z"),
+          },
+          {
+            index: 2,
+            prompt: { text: "Confirm whether compaction occurred", timestamp: "2026-08-12T08:10:00.000Z" },
+            steps: [],
+            response: "Confirmed the reset.",
+            startMs: Date.parse("2026-08-12T08:10:00.000Z"),
+            endMs: Date.parse("2026-08-12T08:20:00.000Z"),
+          },
+        ],
+      },
+    })],
+    correlation: fixtureCorrelation(),
+  });
+
+  const points = report.sessions[0].usageReport.progression;
+  assert.deepEqual(
+    points.map((point) => ({ index: point.index, timestamp: point.timestamp, turnIndex: point.turnIndex, userPrompt: point.userPrompt, promptBoundary: point.promptBoundary })),
+    [
+      { index: 1, timestamp: "2026-08-12T08:02:00.000Z", turnIndex: 1, userPrompt: "Inspect context pressure", promptBoundary: true },
+      { index: 2, timestamp: "2026-08-12T08:07:00.000Z", turnIndex: undefined, userPrompt: undefined, promptBoundary: undefined },
+      { index: 3, timestamp: "2026-08-12T08:12:00.000Z", turnIndex: 2, userPrompt: "Confirm whether compaction occurred", promptBoundary: true },
+      { index: 4, timestamp: "2026-08-12T08:14:00.000Z", turnIndex: 2, userPrompt: undefined, promptBoundary: undefined },
+    ],
+  );
+});
+
+test("Inspector answers a Session without usage evidence with the shared empty report", () => {
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession({ platform: "claude" })],
+    correlation: fixtureCorrelation(),
+  });
+
+  assert.deepEqual(report.sessions[0].usageReport, {
+    actualModelCalls: 0,
+    duplicateRecordsCollapsed: 0,
+    conflictingDuplicateRecords: 0,
+    contextResetCount: 0,
+    modelBoundaryCount: 0,
+    progressionTotalCount: 0,
+    progressionTruncated: false,
+    progression: [],
+  });
+});
+
+test("Inspector projects a complete derived usage report without coercing missing evidence (AC-21)", () => {
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession({
+      platform: "claude",
+
+      tokenUsage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadInputTokens: 100,
+        totalTokens: 115,
+        basis: "model-inference",
+        source: "claude-project-transcript",
+        coverage: "observed",
+      },
+      usageReport: {
+        actualModelCalls: 1_100,
+        duplicateRecordsCollapsed: 177,
+        conflictingDuplicateRecords: 0,
+        currentContextTokens: 370_640,
+        baselineContextTokens: 47_153,
+        netContextDeltaTokens: 323_487,
+        contextResetCount: 1,
+        modelBoundaryCount: 0,
+        processedTokens: 73_088_320,
+        processedTokensBasis: "derived-accounted-usage",
+        processedCoverage: "observed",
+        progressionTotalCount: 1_100,
+        progressionTruncated: true,
+        progression: [
+          { index: 1, model: "claude-opus", contextTokens: 47_153, contextDeltaTokens: null, processedTokens: null, outputTokens: null, boundary: "baseline" },
+          { index: 1_100, model: "claude-opus", contextTokens: 370_640, contextDeltaTokens: 237, processedTokens: 370_877, outputTokens: 237, boundary: "growth" },
+        ],
+      },
+    })],
+    correlation: fixtureCorrelation(),
+  });
+
+  assert.deepEqual(report.sessions[0].usageReport, {
+    actualModelCalls: 1_100,
+    duplicateRecordsCollapsed: 177,
+    conflictingDuplicateRecords: 0,
+    currentContextTokens: 370_640,
+    baselineContextTokens: 47_153,
+    netContextDeltaTokens: 323_487,
+    contextResetCount: 1,
+    modelBoundaryCount: 0,
+    processedTokens: 73_088_320,
+    processedTokensBasis: "derived-accounted-usage",
+    processedCoverage: "observed",
+    providerTotalTokens: 115,
+    progressionTotalCount: 1_100,
+    progressionTruncated: true,
+    progression: [
+      { id: "R1", index: 1, model: "claude-opus", contextTokens: 47_153, boundary: "baseline" },
+      { id: "R1100", index: 1_100, model: "claude-opus", contextTokens: 370_640, contextDeltaTokens: 237, processedTokens: 370_877, outputTokens: 237, boundary: "growth" },
+    ],
+  });
+});
+
+test("Inspector preserves Cursor, Codex, Qoder, and Claude context capabilities", () => {
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [
+      fixtureSession({
+        sessionId: "cursor-native",
+        platform: "cursor",
+        contextManifest: {
+          status: "observed",
+          source: "cursor-native-context-usage-canvas",
+          usedTokens: 56_860,
+          windowTokens: 300_000,
+          percentFull: 19,
+          basis: "host-context-snapshot",
+          compactionCount: 0,
+          layers: [],
+          categories: [
+            { kind: "system_prompt", label: "System prompt", estimatedTokens: 6_495 },
+            { kind: "tools", label: "Tool definitions", estimatedTokens: 24_004 },
+            { kind: "rules", label: "Rules", estimatedTokens: 1_814 },
+            { kind: "skills", label: "Skills", estimatedTokens: 9_986 },
+            { kind: "mcp", label: "MCP", estimatedTokens: 5_227 },
+            { kind: "subagents", label: "Subagent definitions", estimatedTokens: 1_802 },
+            { kind: "conversation", label: "Conversation", estimatedTokens: 7_532 },
+          ],
+        },
+      }),
+      fixtureSession({
+        sessionId: "codex-full",
+        platform: "codex",
+        contextManifest: {
+          status: "observed",
+          source: "codex-rollout-token-count",
+          usedTokens: 120_000,
+          windowTokens: 200_000,
+          percentFull: 60,
+          basis: "prompt-tokens",
+          compactionCount: 2,
+          layers: [{ kind: "developer-message", itemCount: 1 }],
+          categories: [],
+        },
+      }),
+      fixtureSession({
+        sessionId: "qoder-partial",
+        platform: "qoder",
+        contextManifest: {
+          status: "partial",
+          source: "qoder-project-context-ratio",
+          percentFull: 6.0373,
+          basis: "host-context-ratio",
+          compactionCount: 1,
+          layers: [],
+          categories: [],
+        },
+      }),
+      fixtureSession({
+        sessionId: "claude-partial",
+        platform: "claude",
+        contextManifest: {
+          status: "partial",
+          source: "claude-project-transcript",
+          usedTokens: 152_543,
+          basis: "prompt-tokens",
+          compactionCount: 0,
+          layers: [],
+          categories: [],
+        },
+      }),
+    ],
+    correlation: { sessions: [], commits: [] },
+  });
+
+  const sessions = Object.fromEntries(report.sessions.map((session) => [session.platform, session]));
+  assert.deepEqual(sessions.cursor.contextManifest, {
+    status: "observed",
+    source: "cursor-native-context-usage-canvas",
+    rawTextOmitted: true,
+    compactionCount: 0,
+    layers: [],
+    categories: [
+      { kind: "system_prompt", label: "System prompt", estimatedTokens: 6_495 },
+      { kind: "tools", label: "Tool definitions", estimatedTokens: 24_004 },
+      { kind: "rules", label: "Rules", estimatedTokens: 1_814 },
+      { kind: "skills", label: "Skills", estimatedTokens: 9_986 },
+      { kind: "mcp", label: "MCP", estimatedTokens: 5_227 },
+      { kind: "subagents", label: "Subagent definitions", estimatedTokens: 1_802 },
+      { kind: "conversation", label: "Conversation", estimatedTokens: 7_532 },
+    ],
+    usedTokens: 56_860,
+    windowTokens: 300_000,
+    percentFull: 19,
+    basis: "host-context-snapshot",
+  });
+  assert.deepEqual(sessions.codex.contextManifest, {
+    status: "observed",
+    source: "codex-rollout-token-count",
+    rawTextOmitted: true,
+    compactionCount: 2,
+    layers: [{ kind: "developer-message", itemCount: 1 }],
+    categories: [],
+    usedTokens: 120_000,
+    windowTokens: 200_000,
+    percentFull: 60,
+    basis: "prompt-tokens",
+  });
+  assert.deepEqual(sessions.qoder.contextManifest, {
+    status: "partial",
+    source: "qoder-project-context-ratio",
+    rawTextOmitted: true,
+    compactionCount: 1,
+    layers: [],
+    categories: [],
+    percentFull: 6,
+    basis: "host-context-ratio",
+  });
+  assert.deepEqual(sessions.claude.contextManifest, {
+    status: "partial",
+    source: "claude-project-transcript",
+    rawTextOmitted: true,
+    compactionCount: 0,
+    layers: [],
+    categories: [],
+    usedTokens: 152_543,
+    basis: "prompt-tokens",
+  });
+  const html = renderHarnessInspectorHtml(report);
+  assert.match(html, /Context window size unavailable/u);
+  assert.match(html, /Context window not observed/u);
+  assert.match(html, /Tool definitions/u);
+  assert.match(html, /Per-layer token sizes were not retained/u);
 });
 
 test("declared refs keep platform identity and reject ambiguous commit prefixes", () => {
@@ -802,6 +1358,7 @@ test("Harness Inspector help is workspace-independent and sanitizes bad argv (AC
   assert.match(help.stdout, /Feature Tree and Date scope pickers/u);
   assert.match(help.stdout, /inspector\s+Render and open the current workspace with activity/u);
   assert.match(help.stdout, /latest 30 UTC days.*200 commits/u);
+  assert.match(help.stdout, /--json\s+Emit the complete machine-readable render result/u);
   assert.equal(help.stderr, "");
 
   const privateValue = path.join(os.tmpdir(), "private-feature-tree");
@@ -812,6 +1369,7 @@ test("Harness Inspector help is workspace-independent and sanitizes bad argv (AC
 
 test("--open is parsed as a valueless flag without consuming the next argument", () => {
   assert.deepEqual(parseRenderOptions(["--open"]), { "--open": true });
+  assert.deepEqual(parseRenderOptions(["--json"]), { "--json": true });
   assert.deepEqual(parseRenderOptions(["--open", "--out", "report.html"]), {
     "--open": true,
     "--out": "report.html",
@@ -825,7 +1383,13 @@ test("--open is parsed as a valueless flag without consuming the next argument",
   // accepted argument, and value options still require their value.
   assert.throws(() => parseRenderOptions(["--open", "true"]), (error) => error.exitCode === 64);
   assert.throws(() => parseRenderOptions(["--open", "--open"]), /duplicate option: --open/u);
+  assert.throws(() => parseRenderOptions(["--json", "--json"]), /duplicate option: --json/u);
   assert.throws(() => parseRenderOptions(["--out"]), /missing option value: --out/u);
+});
+
+test("the package Inspector script uses the zero-argument startup workflow", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
+  assert.equal(packageJson.scripts.inspector, "node scripts/harness-inspector/cli.mjs");
 });
 
 test("opening a report launches an absolute file URL and reports launch failure", () => {
@@ -856,7 +1420,7 @@ test("render writes the report before opening it and reports the launch in its s
   };
   let exitCode;
   try {
-    exitCode = await main(["render", "--workspace", workspace, "--out", outputPath, "--open"], {
+    exitCode = await main(["render", "--workspace", workspace, "--out", outputPath, "--open", "--json"], {
       open: (target) => {
         // The file must already exist when the viewer is launched.
         openedPaths.push({ target, exists: existsSync(target) });
@@ -889,7 +1453,7 @@ test("zero arguments render the current workspace and open the written report", 
     return true;
   };
   let exitCode;
-  let summary;
+  let humanOutput;
   let embeddedReport;
   try {
     exitCode = await main([], {
@@ -900,8 +1464,11 @@ test("zero arguments render the current workspace and open the written report", 
         return true;
       },
     });
-    summary = JSON.parse(written.join(""));
-    const html = await readFile(summary.outputPath, "utf8");
+    humanOutput = written.join("");
+    const html = await readFile(
+      path.join(canonicalWorkspace, ".qoder", "better-harness-runs", "harness-inspector", "inspector.html"),
+      "utf8",
+    );
     embeddedReport = JSON.parse(scriptBody(
       html,
       "<script type=\"application/json\" id=\"inspector-data\">",
@@ -912,16 +1479,67 @@ test("zero arguments render the current workspace and open the written report", 
   }
 
   assert.equal(exitCode, 0);
-  assert.equal(
-    summary.outputPath,
-    path.join(canonicalWorkspace, ".qoder", "better-harness-runs", "harness-inspector", "inspector.html"),
+  const expectedOutputPath = path.join(
+    canonicalWorkspace,
+    ".qoder",
+    "better-harness-runs",
+    "harness-inspector",
+    "inspector.html",
   );
-  assert.deepEqual(openedPaths, [{ target: summary.outputPath, exists: true }]);
-  assert.equal(summary.opened, true);
+  assert.deepEqual(openedPaths, [{ target: expectedOutputPath, exists: true }]);
+  assert.equal(humanOutput.startsWith("Harness Inspector report ready\n\n"), true);
+  assert.equal(humanOutput.includes(`Report: ${expectedOutputPath}\n`), true);
+  assert.match(humanOutput, /Scope: \d+ days?, \d+ commits?, \d+ sessions?/u);
+  assert.match(humanOutput, /Coverage: \d+ feature nodes?, \d+ stor(?:y|ies), \d+ tool calls?/u);
+  assert.match(humanOutput, /Sessions by provider:/u);
+  assert.match(humanOutput, /Browser: opened/u);
   assert.equal(embeddedReport.filters.since, "2026-07-16T00:00:00.000Z");
   assert.equal(embeddedReport.filters.until, "2026-08-14T23:59:59.999Z");
   assert.equal(embeddedReport.filters.commitLimit, 200);
   assert.equal(embeddedReport.filters.sessionLimit, 100);
+});
+
+test("explicit render defaults to 30 UTC days unless a time bound is supplied (AC-25)", async () => {
+  const workspace = await seededWorkspace("better-harness-inspector-render-window-");
+  const stdoutWrite = process.stdout.write;
+
+  async function renderFilters(extraArgs, suffix) {
+    const outputPath = path.join(workspace, `inspector-${suffix}.html`);
+    const written = [];
+    process.stdout.write = (chunk) => {
+      written.push(String(chunk));
+      return true;
+    };
+    const exitCode = await main([
+      "render",
+      "--workspace", workspace,
+      "--out", outputPath,
+      ...extraArgs,
+    ], { now: new Date("2026-08-14T10:00:00.000Z") });
+    assert.equal(exitCode, 0, written.join(""));
+    const html = await readFile(outputPath, "utf8");
+    return JSON.parse(scriptBody(
+      html,
+      "<script type=\"application/json\" id=\"inspector-data\">",
+    )).filters;
+  }
+
+  try {
+    const defaults = await renderFilters([], "default");
+    assert.equal(defaults.since, "2026-07-16T00:00:00.000Z");
+    assert.equal(defaults.until, "2026-08-14T23:59:59.999Z");
+
+    const sinceOnly = await renderFilters(["--since", "2026-08-01"], "since");
+    assert.equal(sinceOnly.since, "2026-08-01T00:00:00.000Z");
+    assert.equal(sinceOnly.until, null);
+
+    const untilOnly = await renderFilters(["--until", "2026-08-10"], "until");
+    assert.equal(untilOnly.since, null);
+    assert.equal(untilOnly.until, "2026-08-10T23:59:59.999Z");
+  } finally {
+    process.stdout.write = stdoutWrite;
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
 
 test("render leaves the browser alone when --open is absent", async () => {
@@ -936,7 +1554,7 @@ test("render leaves the browser alone when --open is absent", async () => {
   };
   let exitCode;
   try {
-    exitCode = await main(["render", "--workspace", workspace, "--out", outputPath], {
+    exitCode = await main(["render", "--workspace", workspace, "--out", outputPath, "--json"], {
       open: () => {
         openCalls += 1;
         return true;
@@ -972,6 +1590,10 @@ test("a report that could not be opened still succeeds and says so", async () =>
 
   assert.equal(exitCode, 0);
   assert.equal(existsSync(outputPath), true);
-  assert.equal(JSON.parse(written.join("")).opened, false);
+  const humanOutput = written.join("");
+  assert.equal(humanOutput.includes(`Report: ${outputPath}\n`), true);
+  assert.match(humanOutput, /Scope: \d+ days?, 1 commit, \d+ sessions?/u);
+  assert.doesNotMatch(humanOutput, /1 commits/u);
+  assert.match(humanOutput, /Browser: could not open automatically; open the report path above/u);
   await rm(workspace, { recursive: true, force: true });
 });

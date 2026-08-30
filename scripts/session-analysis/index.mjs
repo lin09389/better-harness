@@ -36,3 +36,26 @@ export {
 export { projectSemanticFacets, validateSemanticFacets } from "./semantic-facets.mjs";
 export { sessionAnalysisRef } from "./session-ref.mjs";
 export { buildToolCallTrace, TOOL_CALL_TRACE_SCHEMA_VERSION } from "./tool-call-trace.mjs";
+export {
+  buildUsageReport,
+  DEFAULT_USAGE_PROGRESSION_LIMIT,
+  EMPTY_USAGE_REPORT,
+  projectUsageReport,
+  usageObservationFromEvent,
+  USAGE_BOUNDARY_KINDS,
+} from "./usage-progression.mjs";
+export {
+  additiveUsageAccounting,
+  CACHE_ACCOUNTING_MODE,
+  CACHE_ACCOUNTING_MODES,
+  collapseDuplicateResponseRecords,
+  deriveCacheReuse,
+  observedCacheAccountingMode,
+  observedContextUsage,
+  observedProcessingAccounting,
+  observedTokenUsage,
+  projectCacheReuse,
+  promptContextTokens,
+  usageDeduplicationDiagnostics,
+  USAGE_TOKEN_FIELDS,
+} from "./usage-records.mjs";

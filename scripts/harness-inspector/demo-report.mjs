@@ -1,3 +1,4 @@
+import { buildUsageReport } from "../session-analysis/index.mjs";
 import { parseFeatureTreeMarkdown } from "./feature-tree.mjs";
 import { buildHarnessInspectorReport } from "./report-model.mjs";
 import { renderHarnessInspectorHtml } from "./render-html.mjs";
@@ -82,10 +83,47 @@ function session({
 }) {
   const files = [...new Set(calls.flatMap((item) => item.filePaths ?? []))];
   const steps = [];
+  // The demo Session derives its usage report from the same observations it
+  // renders, through the shared builder, so the fixture cannot describe a
+  // Session the report model could not have produced.
+  const usageObservations = [];
+  const usageStep = (index) => {
+    const inputTokens = 640 + (index * 220);
+    const outputTokens = 120 + (index * 40);
+    const cacheReadInputTokens = 180 + (index * 30);
+    const usedTokens = 2_400 + (index * 950);
+    const percentFull = Math.round((usedTokens / 16_000) * 1_000) / 10;
+    usageObservations.push({
+      model,
+      contextTokens: usedTokens,
+      windowTokens: 16_000,
+      percentFull,
+      processedTokens: inputTokens + cacheReadInputTokens + outputTokens,
+      processedTokensBasis: "derived-accounted-usage",
+      outputTokens,
+    });
+    return {
+      kind: "usage",
+      tokenUsage: {
+        inputTokens,
+        outputTokens,
+        cacheReadInputTokens,
+        reasoningOutputTokens: 40 + (index * 12),
+        totalTokens: inputTokens + outputTokens,
+      },
+      contextUsage: { usedTokens, windowTokens: 16_000, percentFull },
+      source: "public-demo-fixture",
+      model,
+    };
+  };
   calls.forEach((item, index) => {
-    if (notes[index]) steps.push({ kind: "note", text: notes[index] });
+    if (notes[index]) {
+      steps.push({ kind: "note", text: notes[index] });
+      steps.push(usageStep(index));
+    }
     steps.push({ kind: "tool", callStep: item.step, toolName: item.toolName });
   });
+  steps.push(usageStep(notes.length));
   return {
     sessionId,
     platform,
@@ -102,7 +140,31 @@ function session({
     toolCallCount: calls.length,
     fileEditCount: calls.filter((item) => item.operation === "edit-files").length,
     models: [model],
-    tokenUsage: { inputTokens: 2_400, outputTokens: 980, cacheReadInputTokens: 320 },
+    usageReport: buildUsageReport(usageObservations),
+    tokenUsage: {
+      inputTokens: 2_400,
+      outputTokens: 980,
+      cacheReadInputTokens: 320,
+      cacheCreationInputTokens: 40,
+      reasoningOutputTokens: 180,
+      totalTokens: 3_380,
+      basis: "model-inference",
+      source: "public-demo-fixture",
+      coverage: "observed",
+    },
+    runtime: { modelProvider: platform, cliVersion: "demo", effort: "medium" },
+    timestampBasis: "native-event",
+    contextManifest: {
+      status: "observed",
+      source: "public-demo-fixture",
+      rawTextOmitted: true,
+      usedTokens: 2_400,
+      windowTokens: 16_000,
+      percentFull: 15,
+      compactionCount: 1,
+      layers: [{ kind: "project-instructions", itemCount: 1 }],
+      categories: [{ kind: "conversation", label: "Conversation", estimatedTokens: 1_600 }],
+    },
     source: "public-demo-fixture",
     toolTrace: {
       schemaVersion: 2,
@@ -133,6 +195,10 @@ function session({
         prompt: { text: prompt, timestamp: firstSeen },
         steps,
         toolCallCount: calls.length,
+        intermediateCount: notes.length,
+        usageEventCount: notes.length + 1,
+        eventCount: steps.length,
+        shownEventCount: steps.length,
         messageCount: notes.length + calls.length + 2,
         response,
         durationMs: at(lastSeen) - at(firstSeen),

@@ -1,7 +1,39 @@
+export interface InspectorTokenUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokens?: number;
+  basis?: string;
+  source?: string;
+  coverage?: "observed" | "partial" | "unobserved";
+  cacheAccountingMode?: InspectorCacheAccountingMode;
+}
+
+export type InspectorCacheAccountingMode = "included-in-input" | "separate-input-lane" | "relationship-unknown";
+
+export interface InspectorCacheReuse {
+  status: "observed" | "partial" | "inconsistent";
+  accountingMode: InspectorCacheAccountingMode;
+  cacheReadTokens: number;
+  cacheCreationTokens?: number;
+  promptInputTokens?: number;
+  uncachedInputTokens?: number;
+  reusePercent?: number;
+}
+
+export interface InspectorContextWindowUsage {
+  usedTokens?: number;
+  windowTokens?: number;
+  percentFull?: number;
+  basis?: string;
+}
+
 export interface InspectorToolCall {
   id: string;
   callId?: string;
-  kind?: "note" | "tool";
+  kind?: "note" | "tool" | "usage";
   text?: string;
   toolName?: string;
   actionLabel?: string;
@@ -15,7 +47,67 @@ export interface InspectorToolCall {
   detailKind?: string;
   filePath?: string | null;
   filePaths?: string[];
+  tokenUsage?: InspectorTokenUsage;
+  cacheReuse?: InspectorCacheReuse;
+  contextUsage?: InspectorContextWindowUsage;
+  basis?: string;
+  source?: string;
+  model?: string;
+  processedTokens?: number;
+  processedTokensBasis?: string;
+  timestamp?: string | null;
 }
+
+export interface InspectorUsageProgressionPoint {
+  id: string;
+  index: number;
+  timestamp?: string;
+  model?: string;
+  contextTokens?: number;
+  windowTokens?: number;
+  percentFull?: number;
+  contextDeltaTokens?: number;
+  processedTokens?: number;
+  outputTokens?: number;
+  cacheReuse?: InspectorCacheReuse;
+  turnIndex?: number;
+  userPrompt?: string;
+  promptBoundary?: boolean;
+  boundary: "baseline" | "growth" | "steady" | "shrink" | "model-change" | "unobserved";
+}
+
+export interface InspectorUsageReport {
+  actualModelCalls: number;
+  duplicateRecordsCollapsed: number;
+  conflictingDuplicateRecords: number;
+  currentContextTokens?: number;
+  baselineContextTokens?: number;
+  netContextDeltaTokens?: number;
+  contextResetCount: number;
+  modelBoundaryCount: number;
+  processedTokens?: number;
+  processedTokensBasis?: string;
+  processedCoverage?: "observed" | "partial";
+  providerTotalTokens?: number;
+  progressionTotalCount: number;
+  progressionTruncated: boolean;
+  progression: InspectorUsageProgressionPoint[];
+}
+
+// Mirrors EMPTY_USAGE_REPORT in scripts/session-analysis/usage-progression.mjs.
+// A Session projected by the current report model always carries a usage
+// report; this covers older persisted reports without letting each view invent
+// its own "nothing observed" shape.
+export const EMPTY_USAGE_REPORT: InspectorUsageReport = {
+  actualModelCalls: 0,
+  duplicateRecordsCollapsed: 0,
+  conflictingDuplicateRecords: 0,
+  contextResetCount: 0,
+  modelBoundaryCount: 0,
+  progressionTotalCount: 0,
+  progressionTruncated: false,
+  progression: [],
+};
 
 export interface InspectorTurn {
   index: number;
@@ -24,6 +116,7 @@ export interface InspectorTurn {
   steps?: InspectorToolCall[];
   toolCallCount?: number;
   intermediateCount?: number;
+  usageEventCount?: number;
   eventCount?: number;
   shownEventCount?: number;
   processTruncated?: boolean;
@@ -81,7 +174,23 @@ export interface InspectorSession {
   files?: string[];
   prompts?: Array<{ text: string; timestamp?: string | null; turnIndex?: number | null }>;
   models?: string[];
-  tokenUsage?: { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number };
+  tokenUsage?: InspectorTokenUsage;
+  cacheReuse?: InspectorCacheReuse;
+  usageReport?: InspectorUsageReport;
+  runtime?: { modelProvider?: string; cliVersion?: string; effort?: string } | null;
+  contextManifest?: {
+    status?: "observed" | "partial" | "unobserved";
+    source?: string;
+    rawTextOmitted?: boolean;
+    usedTokens?: number;
+    windowTokens?: number;
+    percentFull?: number;
+    basis?: string;
+    compactionCount?: number;
+    layers?: Array<{ kind: string; itemCount: number }>;
+    categories?: Array<{ kind: string; label: string; estimatedTokens: number }>;
+  } | null;
+  timestampBasis?: "native-event" | "native-metadata" | "source-file-mtime" | "unobserved";
   toolActivity?: {
     totalCalls?: number;
     failedCalls?: number;

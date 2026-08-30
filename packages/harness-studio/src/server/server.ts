@@ -24,17 +24,20 @@ import {
 import { createCheckpointHistoryCatalogAdapter } from "./query/checkpoint-history.js";
 import { discoverArtifactProviderRuntime } from "./artifacts/registry/artifact-provider-discovery.js";
 import type { HarnessStudioServerOptions, HarnessStudioState } from "./studio-types.js";
-import { decodeRouteComponent, respondJson } from "./http-utils.js";
+import { decodeRouteComponent, respondJson, sameOriginRequest } from "./http-utils.js";
 import {
   acpAgentEnabled,
   acpExecutorFactory,
+  abortAcpRun,
   cancelAcpRun,
   cancelAllAcpRuns,
   decideAcpPermission,
   ensureAcpRun,
 } from "./acp-runs.js";
+import { effectiveAcpAgentProfiles } from "./acp-agent-catalog.js";
 import {
   abortWorkspaceImport,
+  activateProject,
   analyzeWorkspaceCustomizations,
   analyzeWorkspaceIntent,
   cleanupWorkspaceImports,
@@ -43,6 +46,8 @@ import {
   disconnectWorkspace,
   importWorkspaceFile,
   openWorkspace,
+  removeProject,
+  serveProjectCatalog,
   serveSessionComparison,
   serveWorkspaceCustomizations,
   serveWorkspaceInputs,
@@ -71,7 +76,20 @@ import {
   serveCanvasSdk,
 } from "./artifacts/routes.js";
 import {
+  decideArtifactInteractionProposal,
+  prepareArtifactInteractionProposal,
+  serveArtifactInteraction,
+  serveArtifactInteractionPreview,
+} from "./artifacts/interaction-routes.js";
+import { admitArtifactHostedIntent } from "./artifacts/intent-routes.js";
+import {
+  cancelAllArtifactAgentRuns,
+  cancelArtifactAgentRun,
+  streamArtifactAgentRun,
+} from "./artifacts/agent-run-routes.js";
+import {
   lockCheckpointHistory,
+  isActiveExperimentRunnable,
   resolveCheckpointHistory,
   selectSource,
   serveCheckpointHistory,
@@ -132,6 +150,12 @@ export function createHarnessStudioServer(options: HarnessStudioServerOptions): 
     artifactPaths: resolvedOptions.artifactPaths,
     artifactImports: new Map(),
     artifactEventStreams: 0,
+    artifactAgentRuns: new Map(),
+    artifactIntentAdmissions: new Map(),
+    artifactInteractionProposals: new Map(),
+    projects: new Map(),
+    projectRevision: 0,
+    projectRevisionContexts: new Map(),
     workspaceImports: new Map(),
     workspaceOpenStage: "idle",
     intentAnalysisRunning: false,
@@ -149,6 +173,9 @@ export function createHarnessStudioServer(options: HarnessStudioServerOptions): 
   });
   server.once("close", () => {
     cancelAllAcpRuns(state);
+    cancelAllArtifactAgentRuns(state);
+    state.artifactIntentAdmissions.clear();
+    state.artifactInteractionProposals.clear();
     void Promise.all([cleanupArtifactImports(state), cleanupWorkspaceImports(state)]);
   });
   return server;
@@ -185,14 +212,17 @@ async function route(
 ): Promise<void> {
   const url = new URL(request.url ?? "/", "http://localhost");
   if (request.method === "GET" && url.pathname === "/api/config") {
+    const defaultAcpAgent = options.acpAgent
+      ?? effectiveAcpAgentProfiles(options).find((profile) => profile.agent !== undefined)?.agent;
     respondJson(response, 200, {
       aguiEnabled: options.harnessSource !== undefined,
       acpEnabled: acpAgentEnabled(options),
-      acpAgentLabel: options.acpAgent?.label ?? "ACP Agent",
+      acpAgentLabel: defaultAcpAgent?.label ?? "ACP Agent",
       artifactsEnabled: state.artifactDirectory !== undefined,
       artifactCount: state.artifactPaths?.length,
       evidenceEnabled: activeSourcePath(state.sourceCatalog, state.activeSources, "evidence") !== undefined,
       experimentEnabled: state.activeManifestPath !== undefined,
+      experimentRunnable: await isActiveExperimentRunnable(options, state),
       harnessMode: options.harnessSource === undefined ? "none" : options.harnessMode ?? "configured",
       historyEnabled: state.historyAdapter !== undefined,
       inspectorEnabled: activeSourcePath(state.sourceCatalog, state.activeSources, "inspector") !== undefined,
@@ -200,26 +230,49 @@ async function route(
       workspaceWorkbenchEnabled: state.workspace?.inspectorReport !== undefined,
       workspaceDiscoveryEnabled: options.workspaceSessionProvider !== undefined,
       workspaceConnected: state.workspace !== undefined,
+      projectExecutionEnabled: state.workspace?.localDirectory !== undefined,
+      activeProjectId: state.activeProjectId,
+      projectRevision: state.projectRevision,
       sessionCount: state.workspace?.sessionCount ?? 0,
       inputCount: state.workspace?.inputTrace?.summary.inputCount ?? 0,
       intentAnalysisEnabled: options.intentAnalyzer !== undefined,
       customizationAnalysisEnabled: options.customizationCollector !== undefined,
       customizationAnalyzed: state.customizationAnalysis !== undefined,
       customizationDefinitionCount: state.customizationAnalysis?.summary.definitionCount ?? 0,
-    });
+    }, { "Cache-Control": "no-store" });
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/workspace") {
     respondJson(response, 200, state.workspace === undefined
-      ? { connected: false, sessionCount: 0, omittedCount: 0 }
-      : { connected: true, label: state.workspace.label, sessionCount: state.workspace.sessionCount, omittedCount: state.workspace.omittedCount, providers: state.workspace.providers });
+      ? { connected: false, revision: state.projectRevision, sessionCount: 0, omittedCount: 0 }
+      : { connected: true, id: state.activeProjectId, revision: state.projectRevision, label: state.workspace.label, sessionCount: state.workspace.sessionCount, omittedCount: state.workspace.omittedCount, providers: state.workspace.providers }, { "Cache-Control": "no-store" });
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/projects") {
+    serveProjectCatalog(response, state);
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/projects/open") {
+    await openWorkspace(request, response, options, state);
+    return;
+  }
+  const projectActivation = url.pathname.match(/^\/api\/projects\/([^/]+)\/(?:activate|refresh)$/);
+  if (request.method === "POST" && projectActivation !== null) {
+    const projectId = decodeRouteComponent(response, projectActivation[1]!);
+    if (projectId !== undefined) await activateProject(request, response, options, state, projectId);
+    return;
+  }
+  const projectRemoval = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (request.method === "DELETE" && projectRemoval !== null) {
+    const projectId = decodeRouteComponent(response, projectRemoval[1]!);
+    if (projectId !== undefined) await removeProject(request, response, options, state, projectId);
     return;
   }
   if (request.method === "DELETE" && url.pathname === "/api/workspace") {
     await disconnectWorkspace(request, response, options, state);
     return;
   }
-  if (request.method === "GET" && url.pathname === "/api/workspace/open/status") {
+  if (request.method === "GET" && (url.pathname === "/api/projects/open/status" || url.pathname === "/api/workspace/open/status")) {
     respondJson(response, 200, { stage: state.workspaceOpenStage });
     return;
   }
@@ -240,7 +293,7 @@ async function route(
   const workspaceImportCommit = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/commit$/);
   if (request.method === "POST" && workspaceImportCommit !== null) {
     const sessionId = decodeRouteComponent(response, workspaceImportCommit[1]!);
-    if (sessionId !== undefined) await commitWorkspaceImport(request, response, state, sessionId);
+    if (sessionId !== undefined) await commitWorkspaceImport(request, response, options, state, sessionId);
     return;
   }
   const workspaceImportAbort = url.pathname.match(/^\/api\/workspaces\/([^/]+)$/);
@@ -301,7 +354,7 @@ async function route(
     respondJson(response, 200, {
       sources: describeSources(state.sourceCatalog, state.activeSources),
       active: state.activeSources,
-    });
+    }, { "Cache-Control": "no-store" });
     return;
   }
   if (request.method === "POST" && url.pathname === "/api/sources/select") {
@@ -323,7 +376,12 @@ async function route(
   const runRead = url.pathname.match(/^\/api\/runs\/([^/]+)(?:\/(session))?$/);
   if (url.pathname === "/api/runs" || runRead !== null) {
     const runId = runRead === null ? undefined : decodeRouteComponent(response, runRead[1]!);
-    if (runRead === null || runId !== undefined) await routeRuns(request, response, activeWorkspaceOptions(options, state), url, runId, runRead?.[2] === "session");
+    if (runRead === null || runId !== undefined) {
+      const scopedOptions = request.method === "POST" && options.harnessMode === "workspace-default"
+        ? retainedRunWorkspaceOptions(request, response, options, state)
+        : activeWorkspaceOptions(options, state);
+      if (scopedOptions !== undefined) await routeRuns(request, response, scopedOptions, url, runId, runRead?.[2] === "session");
+    }
     return;
   }
   if (request.method === "GET" && url.pathname === "/inspector") {
@@ -412,7 +470,7 @@ async function route(
   // Every reference the catalog publishes is revision-scoped, so a stale handle
   // fails loudly instead of quietly resolving to whatever the path holds now.
   const artifactRevision = url.pathname.match(/^\/api\/artifacts\/([^/]+)\/revisions\/([0-9a-f]{64})\/(.*)$/);
-  if (request.method === "GET" && artifactRevision !== null) {
+  if (artifactRevision !== null) {
     const id = decodeRouteComponent(response, artifactRevision[1]!);
     const revision = artifactRevision[2]!;
     const tail = artifactRevision[3]!;
@@ -420,44 +478,78 @@ async function route(
     // Viewer documents run at an opaque origin and must fetch their own module,
     // so they are the one artifact surface that stays cross-origin readable.
     // Everything below carries artifact bytes and answers same-origin only.
-    if (!tail.startsWith("viewer/") && !allowArtifactRead(request, response)) return;
+    if ((request.method !== "GET" || !tail.startsWith("viewer/")) && !allowArtifactRead(request, response)) return;
     const scoped = artifactOptions(options, state);
-    if (tail === "content") {
+    if (request.method === "GET" && tail === "content") {
       await serveArtifactContent(response, scoped, id, revision, request.headers["if-none-match"]);
       return;
     }
-    if (tail === "snapshot") {
+    if (request.method === "GET" && tail === "snapshot") {
       await serveArtifactSnapshot(response, scoped, id, revision);
       return;
     }
-    if (tail === "build") {
+    if (request.method === "GET" && tail === "build") {
       await serveArtifactBuild(response, scoped, id, revision);
       return;
     }
     const previewBuildMatch = tail.match(/^builds\/([0-9a-f]{64})\/preview$/);
-    if (previewBuildMatch !== null) {
+    if (request.method === "GET" && previewBuildMatch !== null) {
       await serveArtifactBuildPreview(response, scoped, id, revision, previewBuildMatch[1]!);
       return;
     }
     const resourceMatch = tail.match(/^resources\/([^/]+)$/);
-    if (resourceMatch !== null) {
+    if (request.method === "GET" && resourceMatch !== null) {
       const resourceId = decodeRouteComponent(response, resourceMatch[1]!);
       if (resourceId !== undefined) await serveArtifactSnapshotResource(response, scoped, id, revision, resourceId);
       return;
     }
-    if (tail === "viewer/" || tail === "viewer/index.html") {
+    if (request.method === "GET" && (tail === "viewer/" || tail === "viewer/index.html")) {
       await serveArtifactHostedDocument(response, scoped, id, revision);
       return;
     }
-    if (tail === "viewer/runtime-module.js" || tail === "viewer/runtime-module.js.map"
-      || tail === "viewer/canvas-module.js" || tail === "viewer/canvas-module.js.map") {
+    if (request.method === "GET" && (tail === "viewer/runtime-module.js" || tail === "viewer/runtime-module.js.map"
+      || tail === "viewer/canvas-module.js" || tail === "viewer/canvas-module.js.map")) {
       await serveArtifactHostedModule(response, scoped, id, revision, tail.endsWith(".map"));
       return;
     }
     const viewerResourceMatch = tail.match(/^viewer\/(.+)$/);
-    if (viewerResourceMatch !== null) {
+    if (request.method === "GET" && viewerResourceMatch !== null) {
       const resource = decodeRouteComponent(response, viewerResourceMatch[1]!);
       if (resource !== undefined) await serveArtifactHostedResource(response, scoped, id, revision, resource);
+      return;
+    }
+    if (request.method === "GET" && tail === "interaction") {
+      await serveArtifactInteraction(response, scoped, id, revision);
+      return;
+    }
+    if (request.method === "POST" && tail === "intents") {
+      await admitArtifactHostedIntent(request, response, state, scoped, id, revision);
+      return;
+    }
+    if (request.method === "POST" && tail === "interaction/agent-runs") {
+      await streamArtifactAgentRun(request, response, state, scoped, id, revision);
+      return;
+    }
+    const artifactAgentCancelMatch = tail.match(/^interaction\/agent-runs\/([^/]+)\/cancel$/);
+    if (request.method === "POST" && artifactAgentCancelMatch !== null) {
+      const runId = decodeRouteComponent(response, artifactAgentCancelMatch[1]!);
+      if (runId !== undefined) cancelArtifactAgentRun(request, response, state, id, revision, runId);
+      return;
+    }
+    if (request.method === "POST" && tail === "interaction/proposals") {
+      await prepareArtifactInteractionProposal(request, response, state, scoped, id, revision);
+      return;
+    }
+    const interactionPreviewMatch = tail.match(/^interaction\/proposals\/([^/]+)\/preview$/);
+    if (request.method === "GET" && interactionPreviewMatch !== null) {
+      const proposalId = decodeRouteComponent(response, interactionPreviewMatch[1]!);
+      if (proposalId !== undefined) serveArtifactInteractionPreview(response, state, id, revision, proposalId);
+      return;
+    }
+    const interactionDecisionMatch = tail.match(/^interaction\/proposals\/([^/]+)\/decisions$/);
+    if (request.method === "POST" && interactionDecisionMatch !== null) {
+      const proposalId = decodeRouteComponent(response, interactionDecisionMatch[1]!);
+      if (proposalId !== undefined) await decideArtifactInteractionProposal(request, response, state, scoped, id, revision, proposalId);
       return;
     }
     respondArtifactJson(response, 404, { error: "No such artifact revision route." });
@@ -486,8 +578,10 @@ async function route(
       respondJson(response, 405, { error: "Use POST for /agui/acp." });
       return;
     }
+    if (!acceptProjectBinding(request, response, state, options.harnessMode === "workspace-default")) return;
     const runtimeOptions = activeWorkspaceOptions(options, state);
-    const acpAgent = options.acpAgent!;
+    const acpAgent = options.acpAgent
+      ?? effectiveAcpAgentProfiles(options).find((profile) => profile.agent !== undefined)!.agent!;
     await handleAguiRun(request, response, {
       source: acpAgent.harnessSource ?? DEFAULT_LOCAL_ACP_HARNESS_SOURCE,
       harnessId: acpAgent.harnessId ?? DEFAULT_LOCAL_HARNESS_ID,
@@ -496,6 +590,7 @@ async function route(
       ...(runtimeOptions.sourceRoot !== undefined ? { sourceRoot: runtimeOptions.sourceRoot } : {}),
       executorFactory: acpExecutorFactory(acpAgent, state),
       runAbortSignal: (runId) => ensureAcpRun(state, runId).abortController.signal,
+      onClientDisconnect: (runId) => { abortAcpRun(state, runId); },
     });
     return;
   }
@@ -505,6 +600,7 @@ async function route(
       return;
     }
     if (request.method === "POST" && url.pathname === "/agui") {
+      if (!acceptProjectBinding(request, response, state, options.harnessMode === "workspace-default")) return;
       const runtimeOptions = activeWorkspaceOptions(options, state);
       await handleAguiRun(request, response, {
         source: runtimeOptions.harnessSource!,
@@ -526,6 +622,62 @@ async function route(
     return;
   }
   respondJson(response, 404, { error: `No route for ${request.method} ${url.pathname}` });
+}
+
+function acceptProjectBinding(
+  request: IncomingMessage,
+  response: ServerResponse,
+  state: HarnessStudioState,
+  required: boolean,
+): boolean {
+  const requestedProjectId = request.headers["x-harness-project-id"];
+  const requestedRevision = request.headers["x-harness-project-revision"];
+  if (requestedProjectId === undefined && requestedRevision === undefined) {
+    if (!required) return true;
+    respondJson(response, 409, { error: state.activeProjectId === undefined
+      ? "Open a Project before starting a Project-scoped run."
+      : "A Project id and revision are required to start a Project-scoped run." });
+    return false;
+  }
+  if (typeof requestedProjectId !== "string" || typeof requestedRevision !== "string") {
+    respondJson(response, 409, { error: "The requested Project binding is incomplete." });
+    return false;
+  }
+  const parsedRevision = Number(requestedRevision);
+  if (requestedProjectId !== state.activeProjectId || !Number.isSafeInteger(parsedRevision) || parsedRevision !== state.projectRevision) {
+    respondJson(response, 409, { error: "The selected Project changed before the run started. Review the current Project and retry." });
+    return false;
+  }
+  if (required && state.workspace?.localDirectory === undefined) {
+    respondJson(response, 422, { error: "The selected Project is read-only evidence and cannot host a live run." });
+    return false;
+  }
+  return true;
+}
+
+function retainedRunWorkspaceOptions(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: HarnessStudioServerOptions,
+  state: HarnessStudioState,
+): HarnessStudioServerOptions | undefined {
+  if (!sameOriginRequest(request)) {
+    respondJson(response, 403, { error: "Cross-origin run saving is not allowed." });
+    return undefined;
+  }
+  const requestedProjectId = request.headers["x-harness-project-id"];
+  const requestedRevision = request.headers["x-harness-project-revision"];
+  const parsedRevision = typeof requestedRevision === "string" ? Number(requestedRevision) : Number.NaN;
+  const context = Number.isSafeInteger(parsedRevision) ? state.projectRevisionContexts.get(parsedRevision) : undefined;
+  if (typeof requestedProjectId !== "string" || context === undefined || context.projectId !== requestedProjectId) {
+    respondJson(response, 409, { error: "The starting Project binding is required to retain this run safely." });
+    return undefined;
+  }
+  return {
+    ...options,
+    cwd: context.localDirectory,
+    sourceRoot: options.sourceRoot ?? context.localDirectory,
+  };
 }
 
 function activeWorkspaceOptions(

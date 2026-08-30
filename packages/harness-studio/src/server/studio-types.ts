@@ -2,8 +2,17 @@ import { DebuggerSession } from "../contracts/debugger-session.js";
 import { CheckpointSourcePreview, ExperimentLockReceipt } from "../contracts/experiment-setup.js";
 import { GitCommitDetail, GitRefsSnapshot } from "../contracts/git-history.js";
 import { UserInputTraceV1 } from "../contracts/input-trace.js";
+import { StudioProjectDescriptor, StudioProjectKind } from "../contracts/studio-project.js";
 import { ArtifactCompileLimits } from "./artifacts/registry/artifact-compile-runtime.js";
-import { ExternalArtifactProvider } from "./artifacts/registry/artifact-plugin-registry.js";
+import {
+  ArtifactAdaptContext,
+  ArtifactHostedIntentOutcomeV1,
+  ArtifactInteractionPreparedProposalV1,
+  ArtifactInteractionProvenanceV1,
+  ArtifactInteractionRuntimeImplementation,
+  ArtifactInteractionTransitionReceiptV1,
+  ExternalArtifactProvider,
+} from "./artifacts/registry/artifact-plugin-registry.js";
 import { StudioCustomizationCollector } from "./customization-collector.js";
 import { lockHistoryExperiment } from "./experiment/lock.js";
 import { StudioIntentAnalyzer } from "./intent-analyzer.js";
@@ -89,6 +98,8 @@ export interface HarnessStudioServerOptions {
   executorFactory?: HarnessUiExecutorFactory;
   /** Explicit local ACP Agent. The browser can select it but cannot alter its command or argv. */
   acpAgent?: StudioAcpAgentOptions;
+  /** Server-owned selectable ACP Agent catalog, including unavailable known presets. */
+  acpAgents?: readonly StudioAcpAgentProfile[];
   /** `harness-experiment.v1` manifest; enables the live three-lane trace view. */
   experimentManifestPath?: string;
   /** Runtime-only trajectory sources, useful for previewing imported host history before it is copied. */
@@ -123,6 +134,15 @@ export interface StudioAcpAgentOptions {
   harnessSource?: string;
   harnessId?: string;
   runtimeId?: string;
+  /** Whether Studio applies the manifest lane model or retains the Agent's configured default. */
+  modelPolicy?: "lane" | "agent-default";
+}
+export interface StudioAcpAgentProfile {
+  id: string;
+  label: string;
+  /** Omitted when the known Agent or its ACP bridge is unavailable on this host. */
+  agent?: StudioAcpAgentOptions;
+  unavailableReason?: string;
 }
 export interface ArtifactImportSession {
   directory: string;
@@ -138,6 +158,8 @@ export interface WorkspaceImportSession {
   paths: Set<string>;
   label: string;
   expiry: NodeJS.Timeout;
+  busy: boolean;
+  expired: boolean;
 }
 export interface StudioWorkspace {
   label: string;
@@ -162,6 +184,19 @@ export interface StudioWorkspace {
 export interface StoredWorkspaceSession extends StudioWorkspaceSession {
   retainedRun?: SavedRunRecord;
 }
+export interface StoredStudioProject {
+  descriptor: StudioProjectDescriptor;
+  kind: StudioProjectKind;
+  /** Canonical server-only directory for a remembered local Project. */
+  localDirectory?: string;
+  /** Imported workspaces retain their bounded materialization until removal. */
+  importedWorkspace?: StudioWorkspace;
+}
+export interface StudioProjectRevisionContext {
+  projectId: string;
+  /** Canonical server-only execution root captured when this revision was active. */
+  localDirectory: string;
+}
 export interface HarnessStudioState {
   sourceCatalog: StudioSourceCandidate[];
   activeSources: Partial<Record<StudioSourceKind, string>>;
@@ -176,13 +211,65 @@ export interface HarnessStudioState {
   ownedArtifactDirectory?: string;
   artifactImports: Map<string, ArtifactImportSession>;
   artifactEventStreams: number;
+  artifactAgentRuns: Map<string, ArtifactAgentRunControl>;
+  artifactIntentAdmissions: Map<string, ArtifactHostedIntentAdmissionState>;
+  artifactInteractionProposals: Map<string, ArtifactInteractionProposalState>;
   workspace?: StudioWorkspace;
+  projects: Map<string, StoredStudioProject>;
+  activeProjectId?: string;
+  projectRevision: number;
+  /** Bounded recent revision bindings keep completed runs in their starting Project. */
+  projectRevisionContexts: Map<number, StudioProjectRevisionContext>;
   workspaceImports: Map<string, WorkspaceImportSession>;
-  workspaceOpenStage: "idle" | "choosing" | "discovering";
+  workspaceOpenStage: "idle" | "choosing" | "discovering" | "removing";
   intentAnalysisRunning: boolean;
   customizationAnalysisRunning: boolean;
   customizationAnalysis?: CustomizationAnalysisResponseV1;
   acpRuns: Map<string, AcpRunControl>;
+}
+export interface ArtifactAgentRunControl {
+  artifactId: string;
+  revision: string;
+  abortController: AbortController;
+  startedAtMs: number;
+}
+export interface ArtifactHostedIntentAdmissionState {
+  authorityId: string;
+  artifactId: string;
+  revision: string;
+  bindingId: string;
+  intentId: string;
+  requestDigest: string;
+  promise: Promise<ArtifactHostedIntentOutcomeV1>;
+  outcome?: ArtifactHostedIntentOutcomeV1;
+  failure?: { code: string; status: number; message: string };
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+export interface ArtifactInteractionProposalState {
+  artifactId: string;
+  revision: string;
+  providerId: string;
+  contributionId: string;
+  providerFingerprint: string;
+  context: ArtifactAdaptContext;
+  runtime: ArtifactInteractionRuntimeImplementation;
+  prepared: ArtifactInteractionPreparedProposalV1;
+  provenance?: ArtifactInteractionProvenanceV1;
+  createdAtMs: number;
+  expiresAtMs: number;
+  settling?: {
+    decision: "approve" | "reject";
+    decisionId: string;
+    actorId: string;
+    promise: Promise<ArtifactInteractionTransitionReceiptV1>;
+  };
+  terminal?: {
+    decision: "approve" | "reject";
+    decisionId: string;
+    actorId: string;
+    receipt: ArtifactInteractionTransitionReceiptV1;
+  };
 }
 export interface AcpRunControl {
   abortController: AbortController;

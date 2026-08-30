@@ -98,6 +98,7 @@ const DOCUMENT_EXTENSIONS = new Set([".pptx", ".xlsx", ".docx", ".pdf"]);
  * server-side format selector: the browser consumes only the selected Surface.
  */
 export const PROVIDER_HOSTED_CANVAS_TSX_FORMAT = "cursor-canvas-tsx";
+export const AGENT_REACT_TSX_FORMAT = "agent-react-tsx";
 
 export class ArtifactCatalogContractError extends Error {
   constructor(message: string) {
@@ -132,6 +133,8 @@ export interface ArtifactSurfaceBindingIdentityV1 {
     }
     | { kind: "unavailable"; reason: string };
   capabilities: string[];
+  intent?: { id: string; version: string; protocolVersion: string };
+  interaction?: { id: string; version: string; protocolVersion: string };
   provider?: {
     providerId: string;
     contributionId: string;
@@ -189,6 +192,20 @@ export function artifactSurfaceBindingIdentity(
     },
     surface,
     capabilities: [...new Set(binding.capabilities)].sort(),
+    ...(binding.intent === undefined ? {} : {
+      intent: {
+        id: binding.intent.id,
+        version: binding.intent.version,
+        protocolVersion: binding.intent.protocolVersion,
+      },
+    }),
+    ...(binding.interaction === undefined ? {} : {
+      interaction: {
+        id: binding.interaction.id,
+        version: binding.interaction.version,
+        protocolVersion: binding.interaction.protocolVersion,
+      },
+    }),
     ...(binding.provider === undefined ? {} : {
       provider: {
         providerId: binding.provider.providerId,
@@ -366,6 +383,10 @@ export function describeArtifactCatalog(
     delete renderer.bindingId;
     const digest = entry.digest!;
     const base = artifactRevisionBase(entry.id, digest);
+    const intentEnabled = selected.intent !== undefined
+      && selected.surface.kind === "external-hosted"
+      && selected.renderer.status === "ready"
+      && selected.capabilities.includes("select");
     const snapshotId = `sha256:${createHash("sha256")
       .update(JSON.stringify([
         digest,
@@ -403,6 +424,8 @@ export function describeArtifactCatalog(
         snapshotUri: `${base}/snapshot`,
       },
       ...(selected.backing === "code" ? { build: { snapshotUri: `${base}/build` } } : {}),
+      ...(intentEnabled ? { intent: { intentUri: `${base}/intents` } } : {}),
+      ...(selected.interaction === undefined ? {} : { interaction: { workspaceUri: `${base}/interaction` } }),
       renderer: {
         ...renderer,
         ...(selected.renderer.status === "ready" ? { bindingId: artifactSurfaceBindingId(selected) } : {}),
@@ -482,6 +505,7 @@ export function resolveArtifactFamily(path: string, kind = resolveArtifactKind(p
  * the wire and gives translators nothing to work with.
  */
 export function resolveArtifactFormatCode(path: string): string {
+  if (path.toLowerCase().endsWith(".agent.canvas.tsx")) return AGENT_REACT_TSX_FORMAT;
   if (path.toLowerCase().endsWith(".canvas.tsx")) return PROVIDER_HOSTED_CANVAS_TSX_FORMAT;
   const extension = extname(path).toLowerCase();
   return extension === "" ? "file" : extension.slice(1);

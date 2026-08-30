@@ -508,9 +508,287 @@ test("summarizeSessionEvents extracts repo-relative files, prompts, tools, and t
   assert.equal(summary.toolCallCount, 2);
   assert.equal(summary.promptCount, 1);
   assert.equal(summary.prompts.length, 1);
-  assert.deepEqual(summary.tokenUsage, { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 10 });
+  assert.deepEqual(summary.tokenUsage, {
+    inputTokens: 100,
+    outputTokens: 50,
+    cacheReadInputTokens: 10,
+    basis: "model-inference",
+    source: "normalized-session-events",
+    coverage: "observed",
+  });
   assert.equal(summary.firstSeen, new Date("2026-08-02T10:00:00+08:00").toISOString());
   assert.equal(summary.toolTrace.totalCalls, 2);
+});
+
+test("summarizeSessionEvents aggregates cumulative usage segments and bounded context metadata", () => {
+  const snapshots = [
+    { inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 50, cacheCreationInputTokens: 2, reasoningOutputTokens: 2, totalTokens: 110 },
+    { inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 50, cacheCreationInputTokens: 2, reasoningOutputTokens: 2, totalTokens: 110 },
+    { inputTokens: 150, outputTokens: 15, cacheReadInputTokens: 80, cacheCreationInputTokens: 4, reasoningOutputTokens: 5, totalTokens: 165 },
+    { inputTokens: 20, outputTokens: 2, cacheReadInputTokens: 5, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 22 },
+    { inputTokens: 30, outputTokens: 3, cacheReadInputTokens: 10, cacheCreationInputTokens: 1, reasoningOutputTokens: 1, totalTokens: 33 },
+  ];
+  const events = snapshots.map((modelUsage, index) => ({
+    type: "model.usage.snapshot",
+    category: "model",
+    timestamp: `2026-08-28T10:00:0${index}.000Z`,
+    modelUsage,
+    usageCumulative: true,
+    usageBasis: "model-inference",
+    usageSource: "codex-rollout-token-count",
+  }));
+  events.push(
+    { type: "context.developer", contextLayers: [{ kind: "developer-message", itemCount: 1, aggregation: "sum" }] },
+    { type: "context.developer", contextLayers: [{ kind: "developer-message", itemCount: 1, aggregation: "sum" }] },
+    { type: "session_meta", contextLayers: [{ kind: "base-instructions", itemCount: 1, aggregation: "max" }], runtimeMetadata: { modelProvider: "openai", cliVersion: "fixture-cli" } },
+    { type: "turn_context", model: "fixture-model", runtimeMetadata: { effort: "high" } },
+    { type: "compacted", compactionBoundary: true },
+    { type: "context.usage", currentContextUsage: { usedTokens: 25, windowTokens: 100, source: "codex-rollout-token-count", rawTextOmitted: true } },
+  );
+
+  const summary = summarizeSessionEvents(
+    { sessionId: "usage-session", firstSeen: null, lastSeen: null },
+    events,
+    { repoRoot: path.join(os.tmpdir(), "fixture-repo"), platform: "codex", includeDialogue: true },
+  );
+
+  assert.deepEqual(summary.tokenUsage, {
+    inputTokens: 180,
+    outputTokens: 18,
+    cacheReadInputTokens: 90,
+    cacheCreationInputTokens: 5,
+    reasoningOutputTokens: 6,
+    totalTokens: 198,
+    basis: "model-inference",
+    source: "codex-rollout-token-count",
+    coverage: "observed",
+  });
+  assert.deepEqual(summary.runtime, { modelProvider: "openai", cliVersion: "fixture-cli", effort: "high" });
+  assert.deepEqual(summary.contextManifest, {
+    status: "observed",
+    source: "codex-rollout-token-count",
+    rawTextOmitted: true,
+    usedTokens: 25,
+    windowTokens: 100,
+    percentFull: 25,
+    compactionCount: 1,
+    layers: [
+      { kind: "base-instructions", itemCount: 1 },
+      { kind: "developer-message", itemCount: 2 },
+    ],
+    categories: [],
+  });
+  assert.deepEqual(summary.models, ["fixture-model"]);
+  assert.equal(JSON.stringify(summary.dialogue).includes("developer"), false);
+});
+
+test("summarizeSessionEvents keeps provider-specific partial context evidence honest", () => {
+  const repoRoot = path.join(os.tmpdir(), "fixture-repo");
+  const qoder = summarizeSessionEvents(
+    { sessionId: "qoder-partial", firstSeen: null, lastSeen: null },
+    [{
+      type: "model.response.completed",
+      currentContextUsage: {
+        percentFull: 6.0373,
+        basis: "host-context-ratio",
+        source: "qoder-project-context-ratio",
+      },
+      compactionBoundary: true,
+    }],
+    { repoRoot, platform: "qoder", includeDialogue: true },
+  );
+  assert.deepEqual(qoder.contextManifest, {
+    status: "partial",
+    source: "qoder-project-context-ratio",
+    rawTextOmitted: true,
+    percentFull: 6,
+    basis: "host-context-ratio",
+    compactionCount: 1,
+    layers: [],
+    categories: [],
+  });
+
+  const claude = summarizeSessionEvents(
+    { sessionId: "claude-partial", firstSeen: null, lastSeen: null },
+    [{
+      type: "model.response.completed",
+      currentContextUsage: {
+        usedTokens: 152_543,
+        basis: "prompt-tokens",
+        source: "claude-project-transcript",
+      },
+    }],
+    { repoRoot, platform: "claude", includeDialogue: true },
+  );
+  assert.deepEqual(claude.contextManifest, {
+    status: "partial",
+    source: "claude-project-transcript",
+    rawTextOmitted: true,
+    usedTokens: 152_543,
+    basis: "prompt-tokens",
+    compactionCount: 0,
+    layers: [],
+    categories: [],
+  });
+});
+
+test("summarizeSessionEvents counts only canonical Qoder model responses (AC-23)", () => {
+  const contextUsage = {
+    usedTokens: 116,
+    windowTokens: 1_000,
+    percentFull: 11.6,
+    basis: "host-context-ratio",
+    source: "qoder-project-context-ratio",
+  };
+  const zeroUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+  const summary = summarizeSessionEvents(
+    { sessionId: "qoder-multi-lane", firstSeen: null, lastSeen: null },
+    [
+      {
+        type: "model.response.completed",
+        model: "performance",
+        modelInvocationUsage: zeroUsage,
+        modelUsage: zeroUsage,
+        currentContextUsage: contextUsage,
+        timestamp: "2026-08-28T06:30:23.930Z",
+      },
+      {
+        type: "assistant",
+        usageProgressionExcluded: true,
+        model: "performance",
+        modelInvocationUsage: zeroUsage,
+        modelUsage: zeroUsage,
+        currentContextUsage: contextUsage,
+        timestamp: "2026-08-28T06:30:23.933Z",
+      },
+      {
+        type: "model.response.completed",
+        model: "performance",
+        modelInvocationUsage: zeroUsage,
+        modelUsage: zeroUsage,
+        timestamp: "2026-08-28T06:30:24.000Z",
+      },
+      {
+        type: "turn.finished",
+        usageProgressionExcluded: true,
+        modelInvocationUsage: zeroUsage,
+        modelUsage: zeroUsage,
+        timestamp: "2026-08-28T06:30:25.000Z",
+      },
+      {
+        type: "fork.agent.completed",
+        usageProgressionExcluded: true,
+        modelInvocationUsage: zeroUsage,
+        modelUsage: zeroUsage,
+        timestamp: "2026-08-28T06:30:25.001Z",
+      },
+      {
+        type: "assistant",
+        usageProgressionExcluded: true,
+        currentContextUsage: {
+          percentFull: 12.5,
+          basis: "host-context-ratio",
+          source: "qoder-project-context-ratio",
+        },
+        timestamp: "2026-08-28T06:30:27.000Z",
+      },
+    ],
+    { repoRoot: path.join(os.tmpdir(), "fixture-repo"), platform: "qoder" },
+  );
+
+  assert.equal(summary.usageReport.actualModelCalls, 2);
+  assert.equal(summary.usageReport.progressionTotalCount, 2);
+  assert.equal(summary.usageReport.currentContextTokens, 116);
+  assert.equal(summary.usageReport.progression[0].percentFull, 11.6);
+  assert.equal(summary.contextManifest.percentFull, 12.5);
+});
+
+test("summarizeSessionEvents retains Claude processed usage and dedupe diagnostics (AC-19/AC-20)", () => {
+  const repoRoot = path.join(os.tmpdir(), "fixture-repo");
+  const summary = summarizeSessionEvents(
+    { sessionId: "claude-usage", firstSeen: null, lastSeen: null },
+    [
+      { type: "user", userPrompt: true, userText: "measure it", timestamp: "2026-08-28T01:00:00Z" },
+      {
+        type: "model.response.completed",
+        model: "claude-opus-fixture",
+        modelUsage: { inputTokens: 10, outputTokens: 4, cacheReadInputTokens: 5, cacheCreationInputTokens: 3 },
+        modelInvocationUsage: { inputTokens: 10, outputTokens: 4, cacheReadInputTokens: 5, cacheCreationInputTokens: 3 },
+        currentContextUsage: { usedTokens: 18, basis: "prompt-tokens", source: "claude-project-transcript" },
+        processedTokens: 22,
+        processedTokensBasis: "derived-accounted-usage",
+        usageBasis: "model-inference",
+        usageSource: "claude-project-transcript",
+        usageDeduplication: { duplicateRecordsCollapsed: 2, conflictingDuplicateRecords: 1 },
+        timestamp: "2026-08-28T01:00:01Z",
+      },
+      {
+        type: "model.response.completed",
+        model: "claude-opus-fixture",
+        modelUsage: { inputTokens: 1, outputTokens: 2, cacheReadInputTokens: 20, cacheCreationInputTokens: 4 },
+        modelInvocationUsage: { inputTokens: 1, outputTokens: 2, cacheReadInputTokens: 20, cacheCreationInputTokens: 4 },
+        currentContextUsage: { usedTokens: 25, basis: "prompt-tokens", source: "claude-project-transcript" },
+        processedTokens: 27,
+        processedTokensBasis: "derived-accounted-usage",
+        usageBasis: "model-inference",
+        usageSource: "claude-project-transcript",
+        timestamp: "2026-08-28T01:00:02Z",
+      },
+    ],
+    { repoRoot, platform: "claude", includeDialogue: true },
+  );
+
+  assert.deepEqual(summary.tokenUsage, {
+    inputTokens: 11,
+    outputTokens: 6,
+    cacheReadInputTokens: 25,
+    cacheCreationInputTokens: 7,
+    basis: "model-inference",
+    source: "claude-project-transcript",
+    coverage: "observed",
+  });
+  assert.deepEqual(summary.dialogue.turns[0].steps.map((step) => step.processedTokens), [22, 27]);
+  assert.equal(summary.contextManifest.usedTokens, 25);
+  assert.equal(summary.usageReport.duplicateRecordsCollapsed, 2);
+  assert.equal(summary.usageReport.conflictingDuplicateRecords, 1);
+  assert.equal(summary.usageReport.actualModelCalls, 2);
+  assert.equal(summary.usageReport.processedTokens, 49);
+  assert.equal(summary.usageReport.netContextDeltaTokens, 7);
+  assert.equal(summary.usageReport.progressionTotalCount, 2);
+  assert.equal(summary.usageReport.progressionTruncated, false);
+});
+
+test("Session usage report stays complete when dialogue progression is display-bounded (AC-21)", () => {
+  const events = [
+    { type: "user", userPrompt: true, userText: "measure the long session", timestamp: "2026-08-28T01:00:00Z" },
+    ...Array.from({ length: 1_100 }, (_, index) => ({
+      type: "model.response.completed",
+      model: "claude-long-fixture",
+      modelUsage: { inputTokens: 0, outputTokens: 1, cacheReadInputTokens: 1_000 + index, cacheCreationInputTokens: 0 },
+      modelInvocationUsage: { inputTokens: 0, outputTokens: 1, cacheReadInputTokens: 1_000 + index, cacheCreationInputTokens: 0 },
+      currentContextUsage: { usedTokens: 1_000 + index, basis: "prompt-tokens", source: "claude-project-transcript" },
+      processedTokens: 1_001 + index,
+      processedTokensBasis: "derived-accounted-usage",
+      usageBasis: "model-inference",
+      usageSource: "claude-project-transcript",
+      timestamp: new Date(Date.parse("2026-08-28T01:00:01Z") + index * 1_000).toISOString(),
+    })),
+  ];
+  const summary = summarizeSessionEvents(
+    { sessionId: "claude-long-usage", firstSeen: null, lastSeen: null },
+    events,
+    { repoRoot: path.join(os.tmpdir(), "fixture-repo"), platform: "claude", includeDialogue: true },
+  );
+
+  assert.equal(summary.usageReport.actualModelCalls, 1_100);
+  assert.equal(summary.usageReport.currentContextTokens, 2_099);
+  assert.equal(summary.usageReport.netContextDeltaTokens, 1_099);
+  assert.equal(summary.usageReport.progressionTotalCount, 1_100);
+  assert.equal(summary.usageReport.progression.length, 1_000);
+  assert.equal(summary.usageReport.progressionTruncated, true);
+  assert.equal(summary.usageReport.progression[0].index, 1);
+  assert.equal(summary.usageReport.progression.at(-1).index, 1_100);
+  assert.ok(summary.dialogue.turns[0].usageEventCount > summary.dialogue.turns[0].steps.length);
 });
 
 test("summarizeSessionEvents projects Entire-style dialogue without raw command payloads", () => {
@@ -684,6 +962,39 @@ test("buildSessionTurns folds prompts, steps, and responses into turns (AC-7)", 
   assert.equal(turns[0].eventCount, 2);
   assert.equal(turns[0].durationMs, 3 * 60_000);
   assert.equal(turns[1].response, "Committed.");
+});
+
+test("buildSessionTurns keeps per-inference usage and only same-event context windows (AC-8)", () => {
+  const { turns } = buildSessionTurns([
+    { type: "user", userPrompt: true, userText: "measure each response", timestamp: "2026-08-02T10:00:00Z" },
+    { type: "assistant", content: "I will inspect it.", timestamp: "2026-08-02T10:01:00Z" },
+    {
+      type: "model.response.completed",
+      modelInvocationUsage: { inputTokens: 80, outputTokens: 8, totalTokens: 88 },
+      currentContextUsage: { usedTokens: 145, basis: "prompt-tokens", source: "claude-project-transcript" },
+      usageBasis: "model-inference",
+      usageSource: "claude-project-transcript",
+      timestamp: "2026-08-02T10:01:00Z",
+    },
+    { type: "assistant", content: "Measured.", timestamp: "2026-08-02T10:02:00Z" },
+    {
+      type: "event.token_count",
+      modelInvocationUsage: { inputTokens: 120, outputTokens: 12, cacheReadInputTokens: 60, totalTokens: 132 },
+      currentContextUsage: { usedTokens: 120, windowTokens: 400, source: "codex-rollout-token-count" },
+      usageBasis: "model-inference",
+      usageSource: "codex-rollout-token-count",
+      timestamp: "2026-08-02T10:02:01Z",
+    },
+  ]);
+
+  assert.equal(turns.length, 1);
+  assert.deepEqual(turns[0].steps.map((step) => step.kind), ["note", "usage", "usage"]);
+  assert.equal(turns[0].usageEventCount, 2);
+  assert.equal(turns[0].eventCount, 3);
+  assert.equal(turns[0].response, "Measured.");
+  assert.deepEqual(turns[0].steps[1].tokenUsage, { inputTokens: 80, outputTokens: 8, totalTokens: 88 });
+  assert.deepEqual(turns[0].steps[1].contextUsage, { usedTokens: 145, basis: "prompt-tokens" });
+  assert.deepEqual(turns[0].steps[2].contextUsage, { usedTokens: 120, windowTokens: 400, percentFull: 30 });
 });
 
 test("buildSessionTurns preserves interleaved assistant and tool evidence and marks an unfinished Turn", () => {

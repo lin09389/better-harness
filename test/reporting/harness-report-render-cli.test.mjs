@@ -202,6 +202,14 @@ function embeddedJson(html, id) {
   return JSON.parse(payload);
 }
 
+function visibleHtmlText(html) {
+  return String(html)
+    .replace(/<(?:script|style)\b[^>]*>[\s\S]*?<\/(?:script|style)>/giu, " ")
+    .replace(/<[^>]+>/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
 function reviewedTaskLoopSource() {
   const source = buildTaskLoopSourceCandidate({
     scope: { platform: "qoder", workspace: "/tmp/render-source-project" },
@@ -1176,6 +1184,68 @@ test("portable publication and restoration failure reports PUBLISH_ROLLBACK_FAIL
   });
 });
 
+test("portable HTML Session population stays consistent across generated artifacts", async () => {
+  await withTempDir("better-harness-portable-session-population-", async (root) => {
+    // Given: reviewed portable data with a canonical 2/2 Session population and
+    // no optional usage census or legacy at-a-glance projection.
+    const reviewed = projectTaskLoopFindings(reviewedTaskLoopSource(), {
+      projectName: "render-source-project",
+      direct: true,
+    });
+    reviewed.summary.evidenceBoundary.manifest.platform = "dsh";
+    reviewed.summary.evidenceBoundary.manifest.selection = {
+      strategy: "all-eligible",
+      eligibleCount: 2,
+      analyzedCount: 2,
+      confidence: "High",
+    };
+    reviewed.summary.dimensions = reviewed.summary.dimensions.map((dimension) => {
+      const compact = { ...dimension };
+      delete compact.subdimensions;
+      return compact;
+    });
+    delete reviewed.summary.atAGlance;
+    delete reviewed.summary.usageActivity;
+    delete reviewed.summary.usageEfficiency;
+
+    const findingsPath = path.join(root, "reviewed.findings.json");
+    await writeJson(findingsPath, reviewed);
+
+    // When: every affected portable host routes the same reviewed input through
+    // the public renderer.
+    for (const host of ["dsh", "codex", "grok", "kimi", "workbuddy"]) {
+      const runDir = path.join(root, `run-${host}`);
+      const result = runNode([
+        renderPath,
+        "--findings", findingsPath,
+        "--mode", "html",
+        "--platform", host,
+        "--target", root,
+        "--run-dir", runDir,
+        "--validate",
+        "--json",
+      ], { cwd: root });
+
+      // Then: JSON, Markdown, and both visible HTML surfaces use the same
+      // canonical reviewed population without a host-specific renderer branch.
+      assert.equal(result.status, 0, `${host}: ${result.stderr || result.stdout}`);
+      const findings = JSON.parse(readFileSync(path.join(runDir, "findings.json"), "utf8"));
+      const markdown = readFileSync(path.join(runDir, "report.md"), "utf8");
+      const html = readFileSync(path.join(runDir, "report.html"), "utf8");
+      assert.deepEqual(findings.summary.evidenceBoundary.manifest.selection, {
+        strategy: "all-eligible",
+        eligibleCount: 2,
+        analyzedCount: 2,
+        confidence: "High",
+      }, host);
+      assert.match(markdown, /Session selection: all-eligible; 2 sessions analyzed of 2 eligible sessions; High confidence/u, host);
+      assert.match(html, /<span>Sessions analyzed<\/span>\s*<strong>2 \/ 2<\/strong>\s*<small>High<\/small>/u, host);
+      assert.match(html, /<span>Sampling<\/span><strong>2 \/ 2<\/strong>/u, host);
+      assert.match(html, /<span>Confidence<\/span><strong>High<\/strong>/u, host);
+    }
+  });
+});
+
 test("DSH reuses portable HTML report data, target root, and exact artifact contract", async () => {
   await withTempDir("better-harness-dsh-portable-", async (root) => {
     const target = path.join(root, "DSH target with 空格");
@@ -1224,6 +1294,49 @@ test("DSH reuses portable HTML report data, target root, and exact artifact cont
   });
 });
 
+test("generated DSH HTML uses host-neutral visible copy in both locales", async () => {
+  await withTempDir("better-harness-dsh-portable-copy-", async (root) => {
+    const findingsPath = path.join(root, "reviewed.findings.json");
+    await writeJson(findingsPath, dshReviewedFindings());
+
+    for (const row of [{
+      language: "en",
+      eyebrow: "Harness Insights · Portable HTML",
+      footer: "Generated from one reviewed Harness source · self-contained portable HTML",
+      copySuccess: "Copied. Paste into your coding agent input.",
+      oldCopySuccess: "Copied. Paste into the Codex input.",
+    }, {
+      language: "zh-CN",
+      eyebrow: "Harness 洞察 · 便携式 HTML",
+      footer: "由同一份已复核 Harness source 生成 · 自包含便携式 HTML",
+      copySuccess: "已复制，请粘贴到当前 Coding Agent 输入框。",
+      oldCopySuccess: "已复制，请粘贴到 Codex 输入框。",
+    }]) {
+      const result = runNode([
+        renderPath,
+        "--findings", findingsPath,
+        "--mode", "html",
+        "--platform", "dsh",
+        "--target", root,
+        "--run-dir", `copy-${row.language}`,
+        "--language", row.language,
+        "--validate",
+        "--json",
+      ], { cwd: root });
+
+      assert.equal(result.status, 0, `${row.language}: ${result.stderr || result.stdout}`);
+      const payload = parseRun(result.stdout);
+      const html = readFileSync(path.join(payload.runDir, "report.html"), "utf8");
+      const visibleText = visibleHtmlText(html);
+      assert.equal(visibleText.includes(row.eyebrow), true, row.language);
+      assert.equal(visibleText.includes(row.footer), true, row.language);
+      assert.equal(visibleText.includes("Codex"), false, row.language);
+      assert.equal(html.includes(row.copySuccess), true, row.language);
+      assert.equal(html.includes(row.oldCopySuccess), false, row.language);
+    }
+  });
+});
+
 test("render routes html output by host id and fails closed on unknown platforms", async () => {
   await withTempDir("better-harness-render-platform-", async (root) => {
     const findingsPath = path.join(root, "input.findings.json");
@@ -1238,6 +1351,11 @@ test("render routes html output by host id and fails closed on unknown platforms
       const payload = parseRun(routed.stdout);
       assert.equal(payload.outputLocation.requestedOut, `.${platform}/better-harness`);
       assert.equal(payload.runDir.includes(path.join(`.${platform}`, "better-harness")), true);
+      const html = readFileSync(path.join(payload.runDir, "report.html"), "utf8");
+      const visibleText = visibleHtmlText(html);
+      assert.equal(visibleText.includes("Harness Insights · Portable HTML"), true, platform);
+      assert.equal(visibleText.includes("Codex HTML"), false, platform);
+      assert.equal(html.includes("Paste into the Codex input"), false, platform);
     }
 
     const rejected = runNode(
@@ -1564,6 +1682,38 @@ test("HTML evidence episode coverage preserves canonical summary facts and legac
   assert.match(canonicalHtml, /<span>Edited episodes<\/span><strong>12<\/strong>/u);
   assert.match(legacyHtml, /<span>Task episodes<\/span><strong>7<\/strong>/u);
   assert.match(legacyHtml, /<span>Edited episodes<\/span><strong>5<\/strong>/u);
+});
+
+test("portable HTML Session population distinguishes valid zero from unavailable data", () => {
+  const fixture = sampleFindings();
+  const reportData = {
+    ...fixture,
+    language: "en",
+    target: { name: "render-fixture", path: "/tmp/render-fixture" },
+  };
+
+  const zeroHtml = renderHtml({
+    ...reportData,
+    summary: {
+      ...reportData.summary,
+      evidenceBoundary: {
+        manifest: {
+          selection: {
+            strategy: "all-eligible",
+            eligibleCount: 0,
+            analyzedCount: 0,
+            confidence: "Low",
+          },
+        },
+      },
+    },
+  });
+  const unavailableHtml = renderHtml(reportData);
+
+  assert.match(zeroHtml, /<span>Sessions analyzed<\/span>\s*<strong>0 \/ 0<\/strong>\s*<small>Low<\/small>/u);
+  assert.match(zeroHtml, /<span>Sampling<\/span><strong>0 \/ 0<\/strong>/u);
+  assert.match(unavailableHtml, /<span>Sessions analyzed<\/span>\s*<strong>N\/A<\/strong>/u);
+  assert.match(unavailableHtml, /<span>Sampling<\/span><strong>N\/A<\/strong>/u);
 });
 
 test("HTML CJK phrase breaking emits bounded deterministic markup without changing report data", () => {

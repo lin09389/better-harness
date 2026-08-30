@@ -19,6 +19,12 @@ import {
 } from "../provider-runner.mjs";
 import { parseResultFacts } from "../result-facts.mjs";
 import { mergeTimeRange, normalizeCliDate, normalizeTimestamp, timestampMillis, withinTimeRange } from "../time.mjs";
+import {
+  additiveUsageAccounting,
+  CACHE_ACCOUNTING_MODE,
+  collapseDuplicateResponseRecords,
+  promptContextTokens,
+} from "../usage-records.mjs";
 import { WORKSPACE_CWD_MATCH, classifyWorkspaceCwd } from "../workspace-match.mjs";
 
 function isWorkspaceMatch(candidate, workspace) {
@@ -197,13 +203,29 @@ function transcriptEvents(raw, sourceRef, options) {
     if (raw?.permissionMode) event.permissionMode = raw.permissionMode;
     events.push(event);
     if (rawType === "assistant" && usage) {
+      const promptTokens = promptContextTokens(usage);
       events.push({
         ...base,
         type: "model.response.completed",
         category: "model",
         model: model ?? null,
         modelUsage: usage,
+        modelInvocationUsage: usage,
+        cacheAccountingMode: CACHE_ACCOUNTING_MODE.SEPARATE_INPUT_LANE,
         usageFieldsObserved: true,
+        usageBasis: "model-inference",
+        usageSource: "claude-project-transcript",
+        // Claude reports non-overlapping input, cache, and output lanes, so the
+        // shared additive accounting applies.
+        ...additiveUsageAccounting(usage),
+        ...(promptTokens !== null ? {
+          currentContextUsage: {
+            usedTokens: promptTokens,
+            basis: "prompt-tokens",
+            source: "claude-project-transcript",
+            rawTextOmitted: true,
+          },
+        } : {}),
         responseId: raw?.message?.id ?? raw?.uuid ?? null,
         evidenceRef: evidenceRef(raw, sourceRef, "model.response.completed"),
         summary: "Claude model response completed",
@@ -392,7 +414,7 @@ function finalizeSession(session) {
   );
 }
 
-function dedupeEvents(events) {
+function dedupeToolLifecycleRecords(events) {
   const seen = new Set();
   return events.filter((event) => {
     const key = event.toolInvocationId && event.lifecyclePhase
@@ -402,6 +424,17 @@ function dedupeEvents(events) {
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
+  });
+}
+
+function dedupeEvents(events) {
+  // Claude rewrites one assistant record as its counters settle, so the latest
+  // payload is the canonical one; synthetic and all-zero placeholders stand for
+  // responses the host never accounted for. Duplicate counts stay as evidence.
+  return collapseDuplicateResponseRecords(dedupeToolLifecycleRecords(events), {
+    canonical: "latest",
+    dropSyntheticRecords: true,
+    countDiagnostics: true,
   });
 }
 

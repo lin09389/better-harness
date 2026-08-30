@@ -20,6 +20,7 @@ import {
 } from "../provider-runner.mjs";
 import { parseResultFacts } from "../result-facts.mjs";
 import { mergeTimeRange, normalizeCliDate, normalizeTimestamp, timestampMillis, withinTimeRange } from "../time.mjs";
+import { collapseDuplicateResponseRecords } from "../usage-records.mjs";
 import { WORKSPACE_CWD_MATCH, classifyWorkspaceCwd } from "../workspace-match.mjs";
 
 function isWorkspaceMatch(candidate, workspace) {
@@ -272,14 +273,9 @@ function transcriptEvents(raw, sourceRef, options) {
 
 function dedupeUsageEvents(events) {
   // Parallel tool calls from one model response repeat the same usage
-  // snapshot; keep only the first event per response id.
-  const seen = new Set();
-  return events.filter((event) => {
-    if (event.type !== "model.response.completed" || !event.responseId) return true;
-    if (seen.has(event.responseId)) return false;
-    seen.add(event.responseId);
-    return true;
-  });
+  // snapshot; the first observation is canonical and the repeats carry no
+  // additional evidence, so they are dropped without a diagnostic count.
+  return collapseDuplicateResponseRecords(events, { canonical: "first" });
 }
 
 async function probeTranscript(filePath, scope, directoryCandidate) {

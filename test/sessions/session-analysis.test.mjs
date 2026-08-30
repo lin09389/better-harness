@@ -6,6 +6,7 @@ import { test } from "vitest";
 
 import { createAnalyzer } from "../../scripts/session-analysis.mjs";
 import {
+  mergeQoderAssistantContextIntoResponses,
   QoderSessionAnalyzer,
   workspaceToQoderSlug,
   workspaceToQoderSlugVariants,
@@ -17,6 +18,7 @@ import { detectPlanningSignals } from "../../scripts/session-analysis/planning-s
 import { privacySafeUserInputSummary } from "../../scripts/session-analysis/privacy-safe-text.mjs";
 import { isSessionAnalysisRef, sessionAnalysisRef } from "../../scripts/session-analysis/session-ref.mjs";
 import { buildToolCallTrace } from "../../scripts/session-analysis/tool-call-trace.mjs";
+import { summarizeSessionEvents } from "../../scripts/commit-session-link/index.mjs";
 
 async function writeJson(filePath, value) {
   await mkdir(path.dirname(filePath), { recursive: true });
@@ -542,6 +544,28 @@ test("Qoder and Codex preserve only explicit user-visible handoff and delivery f
     type: "event_msg",
     payload: { type: "agent_message", message: "done" },
   }, sourceRef);
+  const codexDeveloper = codexAnalyzer.normalizeEvent({
+    type: "response_item",
+    payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "private developer context" }] },
+  }, sourceRef, { includeContent: true });
+  const codexUsage = codexAnalyzer.normalizeEvent({
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: {
+          input_tokens: 120,
+          cached_input_tokens: 80,
+          cache_write_input_tokens: 4,
+          output_tokens: 30,
+          reasoning_output_tokens: 8,
+          total_tokens: 150,
+        },
+        last_token_usage: { input_tokens: 40, output_tokens: 10, total_tokens: 50 },
+        model_context_window: 200,
+      },
+    },
+  }, sourceRef);
   const qoderToolUseOnly = qoderAnalyzer.normalizeEvent({
     type: "assistant",
     stop_reason: "tool_use",
@@ -553,11 +577,26 @@ test("Qoder and Codex preserve only explicit user-visible handoff and delivery f
     assert.equal(normalized.taskCompleted, true);
     assert.equal(normalized.userCorrection, true);
   }
-  assert.equal(codexReasoning.type, "assistant");
+  assert.equal(codexReasoning.type, "reasoning");
   assert.equal(codexReasoning.userVisibleAssistantMessage, undefined);
+  assert.equal(codexReasoning.content, undefined);
   assert.equal(codexReasoning.taskCompleted, undefined);
   assert.equal(codexReasoning.userCorrection, undefined);
   assert.equal(codexAgentMessage.userVisibleAssistantMessage, true);
+  assert.equal(codexDeveloper.type, "context.developer");
+  assert.equal(codexDeveloper.content, undefined);
+  assert.deepEqual(codexDeveloper.contextLayers, [{ kind: "developer-message", itemCount: 1, aggregation: "sum" }]);
+  assert.equal(codexUsage.usageCumulative, true);
+  assert.equal(codexUsage.modelUsage.totalTokens, 150);
+  assert.equal(codexUsage.modelUsage.cacheReadInputTokens, 80);
+  assert.deepEqual(codexUsage.modelInvocationUsage, { inputTokens: 40, outputTokens: 10, totalTokens: 50 });
+  assert.deepEqual(codexUsage.currentContextUsage, {
+    usedTokens: 40,
+    windowTokens: 200,
+    basis: "prompt-tokens",
+    source: "codex-rollout-token-count",
+    rawTextOmitted: true,
+  });
   assert.equal(qoderToolUseOnly.userVisibleAssistantMessage, undefined);
 });
 
@@ -835,6 +874,125 @@ test("Qoder analyzer discovers source roots and merges source coverage by sessio
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("Qoder preserves host context ratio, real session window, and compaction boundaries", async () => {
+  const fixture = await makeQoderFixture();
+  const analyzer = new QoderSessionAnalyzer();
+  await writeQoderConversation(fixture.home, fixture.slug, fixture.sessionId, [
+    {
+      type: "runtime-config",
+      sessionId: fixture.sessionId,
+      timestamp: "2026-06-18T10:00:00.000Z",
+      contextWindow: 1_000_000,
+    },
+    {
+      type: "assistant",
+      sessionId: fixture.sessionId,
+      timestamp: "2026-06-18T10:00:04.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          context_usage_ratio: 0.060373,
+        },
+      },
+    },
+    {
+      type: "system",
+      sessionId: fixture.sessionId,
+      timestamp: "2026-06-18T10:00:05.000Z",
+      compactMetadata: { preTokens: 147_770, postTokens: 2_431 },
+    },
+  ]);
+
+  try {
+    const scope = await analyzer.resolveScope({ home: fixture.home, workspace: fixture.workspace });
+    const roots = await analyzer.discoverSourceRoots(scope);
+    const sessions = await analyzer.discoverSessions(scope, roots);
+    const session = sessions.find((candidate) => candidate.sessionId === fixture.sessionId);
+    assert.ok(session);
+    const events = await analyzer.readSession(session, scope);
+    const response = events.find((event) => event.currentContextUsage?.percentFull !== undefined);
+    assert.deepEqual(response?.currentContextUsage, {
+      percentFull: 6.0373,
+      basis: "host-context-ratio",
+      source: "qoder-project-context-ratio",
+      rawTextOmitted: true,
+      usedTokens: 60_373,
+      windowTokens: 1_000_000,
+    });
+    assert.equal(events.filter((event) => event.compactionBoundary === true).length, 1);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Qoder merges assistant context into one canonical model response (AC-23)", () => {
+  const events = [
+    {
+      sessionId: "qoder-multi-lane",
+      type: "model.response.completed",
+      sourceKind: "logs-session",
+      timestamp: "2026-08-28T06:30:23.930Z",
+      model: "performance",
+      stopReason: "tool_use",
+      requestId: "request-1",
+      modelInvocationUsage: { inputTokens: 0, outputTokens: 0 },
+    },
+    {
+      sessionId: "qoder-multi-lane",
+      type: "assistant",
+      sourceKind: "project-jsonl",
+      timestamp: "2026-08-28T06:30:23.933Z",
+      model: "performance",
+      stopReason: "tool_use",
+      responseId: "response-1",
+      currentContextUsage: {
+        percentFull: 11.6,
+        basis: "host-context-ratio",
+        source: "qoder-project-context-ratio",
+      },
+    },
+    {
+      sessionId: "qoder-multi-lane",
+      type: "model.response.completed",
+      sourceKind: "logs-session",
+      timestamp: "2026-08-28T06:30:24.000Z",
+      model: "performance",
+      stopReason: "end_turn",
+      requestId: "request-2",
+      modelInvocationUsage: { inputTokens: 0, outputTokens: 0 },
+    },
+    {
+      sessionId: "qoder-multi-lane",
+      type: "assistant",
+      sourceKind: "project-jsonl",
+      timestamp: "2026-08-28T06:30:24.001Z",
+      model: "performance",
+      stopReason: "tool_use",
+      responseId: "unmatched-response",
+      currentContextUsage: {
+        percentFull: 12.5,
+        basis: "host-context-ratio",
+        source: "qoder-project-context-ratio",
+      },
+    },
+  ];
+
+  const merged = mergeQoderAssistantContextIntoResponses(events);
+  const responses = merged.filter((event) => event.type === "model.response.completed");
+  assert.equal(responses.length, 2);
+  assert.equal(responses[0].currentContextUsage.percentFull, 11.6);
+  assert.equal(Object.hasOwn(responses[1], "currentContextUsage"), false);
+  assert.equal(merged[3].currentContextUsage.percentFull, 12.5);
+  assert.equal(merged[1].responseId, "response-1");
+  assert.equal(merged[1].usageProgressionExcluded, true);
+  assert.equal(merged[3].usageProgressionExcluded, true);
 });
 
 test("Qoder workspace analysis excludes unrelated home-only sessions", async () => {
@@ -2322,6 +2480,93 @@ test("Codex adapter normalizes current event_msg and response_item records", asy
     assert.equal(result.selection.strategy, "all-eligible");
     assert.equal("sessions" in result.selection, false);
     assert.equal(result.insights.manifest.adapter.version, "codex-v2");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex keeps child rollout usage out of the parent while retaining real parent compaction", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "better-harness-codex-rollout-identity-"));
+  const workspace = path.join(root, "workspace", "better-harness");
+  const home = path.join(root, ".codex");
+  const parentId = "codex-parent-rollout";
+  const reviewOneId = "codex-auto-review-one";
+  const reviewTwoId = "codex-auto-review-two";
+  const sessionPath = (...parts) => path.join(home, "sessions", "2026", "08", "28", ...parts);
+  const tokenCount = (timestamp, cumulativeTotal, currentInput, lastTotal = currentInput) => ({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: {
+          input_tokens: cumulativeTotal,
+          output_tokens: 0,
+          total_tokens: cumulativeTotal,
+        },
+        last_token_usage: {
+          input_tokens: currentInput,
+          output_tokens: 0,
+          total_tokens: lastTotal,
+        },
+        model_context_window: 260,
+      },
+    },
+  });
+
+  await writeJsonl(sessionPath(`rollout-2026-08-28T10-00-00-${parentId}.jsonl`), [
+    { timestamp: "2026-08-28T10:00:00.000Z", type: "session_meta", payload: { id: parentId, session_id: parentId, cwd: workspace } },
+    tokenCount("2026-08-28T10:00:01.000Z", 30, 30),
+    tokenCount("2026-08-28T10:00:04.000Z", 250, 240),
+    { timestamp: "2026-08-28T10:00:07.000Z", type: "compacted", payload: {} },
+    tokenCount("2026-08-28T10:00:08.000Z", 260, 0, 24_661),
+    tokenCount("2026-08-28T10:00:10.000Z", 400, 120),
+  ]);
+  await writeJsonl(sessionPath(`rollout-2026-08-28T10-00-02-${reviewOneId}.jsonl`), [
+    { timestamp: "2026-08-28T10:00:02.000Z", type: "session_meta", payload: { id: reviewOneId, session_id: parentId, cwd: workspace } },
+    tokenCount("2026-08-28T10:00:03.000Z", 90, 80),
+    tokenCount("2026-08-28T10:00:06.000Z", 150, 140),
+  ]);
+  await writeJsonl(sessionPath(`rollout-2026-08-28T10-00-05-${reviewTwoId}.jsonl`), [
+    { timestamp: "2026-08-28T10:00:05.000Z", type: "session_meta", payload: { id: reviewTwoId, session_id: parentId, cwd: workspace } },
+    tokenCount("2026-08-28T10:00:09.000Z", 25, 20),
+  ]);
+
+  const { CodexSessionAnalyzer } = await import("../../scripts/session-analysis/platforms/codex.mjs");
+  const analyzer = new CodexSessionAnalyzer();
+  try {
+    const scope = await analyzer.resolveScope({ home, workspace });
+    const roots = await analyzer.discoverSourceRoots(scope);
+    const sessions = await analyzer.discoverSessions(scope, roots);
+    assert.deepEqual(
+      sessions.map((session) => session.sessionId).sort(),
+      [parentId, reviewOneId, reviewTwoId].sort(),
+    );
+
+    const parent = sessions.find((session) => session.sessionId === parentId);
+    assert.ok(parent);
+    assert.equal(parent.sourceRefs.length, 1);
+    const events = await analyzer.readSession(parent, scope);
+    assert.equal(events.filter((event) => event.type === "event.token_count").length, 4);
+    assert.equal(events.every((event) => event.sessionId === parentId), true);
+    const resetSnapshot = events.filter((event) => event.type === "event.token_count")[2];
+    assert.equal(resetSnapshot.emptyInvocationSnapshot, true);
+    assert.equal(resetSnapshot.usageProgressionExcluded, true);
+    assert.equal(Object.hasOwn(resetSnapshot, "modelInvocationUsage"), false);
+    assert.equal(Object.hasOwn(resetSnapshot, "currentContextUsage"), false);
+
+    const summary = summarizeSessionEvents(parent, events, {
+      repoRoot: workspace,
+      platform: "codex",
+    });
+    assert.equal(summary.tokenUsage.totalTokens, 400);
+    assert.equal(summary.contextManifest.usedTokens, 120);
+    assert.equal(summary.contextManifest.compactionCount, 1);
+    assert.equal(summary.usageReport.actualModelCalls, 3);
+    assert.equal(summary.usageReport.currentContextTokens, 120);
+    assert.equal(summary.usageReport.netContextDeltaTokens, 90);
+    assert.equal(summary.usageReport.contextResetCount, 1);
+    assert.deepEqual(summary.usageReport.progression.map((point) => point.contextTokens), [30, 240, 120]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
 import { HarnessRunEmitter } from "@qoder-ai/harness/exec";
 import { buildHarnessInspectorReport, emptyFeatureTree } from "../../../../scripts/harness-inspector/index.mjs";
+import { buildUsageReport } from "../../../../scripts/session-analysis/index.mjs";
 import { startHarnessStudioServer } from "../../dist/server/server.js";
 import { sessionFromRetainedRun } from "../../dist/server/debugger-session-transform.js";
 import { createDocxFixture } from "../docx-fixture.ts";
@@ -29,6 +30,7 @@ test.beforeAll(async () => {
   await writeFile(join(artifactDirectory, "deck.pptx"), createPptxFixture("01"));
   await writeFile(join(artifactDirectory, "workbook.xlsx"), createXlsxFixture());
   await writeFile(join(artifactDirectory, "component.canvas.tsx"), 'document.body.dataset.moduleEvaluated = "yes"; export default () => <p data-preview="current">first render</p>;\n', "utf8");
+  await writeFile(join(artifactDirectory, "orders.agent.canvas.tsx"), agentReactSource("first verified build"), "utf8");
   await writeFile(join(artifactDirectory, "fallback.canvas.tsx"), 'export default () => <p data-preview="canvas-fallback">Studio React fallback</p>;\n', "utf8");
   await writeFile(join(artifactDirectory, "broken.canvas.tsx"), 'export default () => <main>broken;\n', "utf8");
   await writeFile(join(artifactDirectory, "throws.canvas.tsx"), 'export default function Boom() { throw new Error("render exploded"); }\n', "utf8");
@@ -102,14 +104,29 @@ test.beforeAll(async () => {
     toolCallCount: tools.length,
     warnings: [],
     timeline: [
-      ...tools.map((name, index) => ({ kind: "tool-call", id: `tool_${index}`, name, argsText: "{}", status: "completed", resultText: "ok" })),
+      ...tools.map((tool, index) => ({
+        kind: "tool-call",
+        id: `tool_${index}`,
+        name: typeof tool === "string" ? tool : tool.name,
+        argsText: typeof tool === "string" ? "{}" : tool.argsText,
+        status: "completed",
+        resultText: "ok",
+      })),
       { kind: "message", id: "message_1", text: `${prompt} complete`, complete: true },
     ],
   });
   const workspaceRecords = [
     retainedRun("run_left", "2026-08-20T10:00:00.000Z", "Repair parser", ["Read", "Edit", "Bash"]),
-    retainedRun("run_right", "2026-08-20T11:00:00.000Z", "Repair renderer", ["Read", "Bash"]),
+    retainedRun("run_right", "2026-08-20T11:00:00.000Z", "Repair renderer", ["Read", { name: "Edit", argsText: '{"path":"review.diff"}' }, "Bash"]),
   ];
+  await writeFile(join(selectedWorkspace, "review.diff"), [
+    "diff --git a/src/viewer.ts b/src/viewer.ts",
+    "--- a/src/viewer.ts",
+    "+++ b/src/viewer.ts",
+    "@@ -1 +1 @@",
+    "-export const mode = 'tool';",
+    "+export const mode = 'native-file';",
+  ].join("\n"), "utf8");
   const workspaceInspectorReport = buildHarnessInspectorReport({
     repoRoot: selectedWorkspace,
     featureTree: emptyFeatureTree(),
@@ -122,6 +139,41 @@ test.beforeAll(async () => {
       promptCount: 1,
       assistantMessageCount: 1,
       toolCallCount: record.toolCallCount,
+      models: ["claude-4.5-sonnet", "claude-fable-5", "claude-fable-5-thinking-high", "composer-2.5-fast"],
+      tokenUsage: {
+        inputTokens: 180,
+        outputTokens: 18,
+        cacheReadInputTokens: 90,
+        cacheCreationInputTokens: 5,
+        reasoningOutputTokens: 6,
+        totalTokens: 198,
+        basis: "model-inference",
+        source: "fixture-session-usage",
+        coverage: "observed",
+      },
+      runtime: { modelProvider: "fixture", cliVersion: "1.0.0", effort: "high" },
+      timestampBasis: "native-event",
+      // Derived from the same observations the dialogue renders, through the
+      // shared builder, so the fixture cannot assert numbers the report model
+      // could not produce.
+      usageReport: buildUsageReport([
+        { model: "fixture-model", contextTokens: 25, windowTokens: 100, percentFull: 25, outputTokens: 8, timestamp: new Date(Date.parse(record.savedAt) + 1_000).toISOString() },
+        { model: "fixture-model", contextTokens: 40, windowTokens: 100, percentFull: 40, outputTokens: 10, timestamp: new Date(Date.parse(record.savedAt) + 2_000).toISOString() },
+      ]),
+      contextManifest: {
+        status: "observed",
+        source: "fixture-context-usage",
+        rawTextOmitted: true,
+        usedTokens: 40,
+        windowTokens: 100,
+        percentFull: 40,
+        compactionCount: 1,
+        layers: [
+          { kind: "developer-message", itemCount: 2 },
+          { kind: "skills", itemCount: 1 },
+        ],
+        categories: [{ kind: "rules", label: "Rules", estimatedTokens: 10 }],
+      },
       toolActivity: {
         calls: record.timeline.filter((event) => event.kind === "tool-call").map((event, index) => ({
           id: event.id,
@@ -139,10 +191,31 @@ test.beforeAll(async () => {
         index: 1,
         anchorId: "turn-1",
         prompt: { text: record.prompt, timestamp: record.savedAt },
-        steps: record.timeline.filter((event) => event.kind === "tool-call").map((event) => ({ kind: "tool", callId: event.id, toolName: event.name })),
+        steps: [
+          ...record.timeline.filter((event) => event.kind === "tool-call").map((event) => ({ kind: "tool", callId: event.id, toolName: event.name })),
+          {
+            kind: "usage",
+            tokenUsage: { inputTokens: 90, outputTokens: 8, cacheReadInputTokens: 45, totalTokens: 98 },
+            contextUsage: { usedTokens: 25, windowTokens: 100, percentFull: 25 },
+            source: "fixture-response-usage",
+            model: "fixture-model",
+          },
+          {
+            kind: "usage",
+            tokenUsage: { inputTokens: 90, outputTokens: 10, cacheReadInputTokens: 45, totalTokens: 100 },
+            contextUsage: { usedTokens: 40, windowTokens: 100, percentFull: 40 },
+            source: "fixture-response-usage",
+            model: "fixture-model",
+          },
+        ],
         toolCallCount: record.toolCallCount,
+        usageEventCount: 2,
+        eventCount: record.toolCallCount + 2,
+        shownEventCount: record.toolCallCount + 2,
         response: `${record.prompt} complete`,
         responseStatus: "retained",
+        startMs: Date.parse(record.savedAt),
+        endMs: Date.parse(record.savedAt) + 3_000,
       }] },
     })),
     correlation: { commits: [] },
@@ -203,6 +276,35 @@ function watchFailures(page) {
   });
   page.on("pageerror", (error) => failures.push(error.message));
   return failures;
+}
+
+function agentReactSource(label, throwMessage, lateThrowMessage) {
+  return [
+    'import { defineArtifactView, useArtifactAction, useArtifactState } from "@studio/agent-react";',
+    "function Orders() {",
+    ...(throwMessage === undefined ? [] : [`  throw new Error(${JSON.stringify(throwMessage)});`]),
+    '  const [orders, setOrders] = useArtifactState<readonly string[]>("/orders");',
+    '  const showSource = useArtifactAction("studio.show-source");',
+    "  const addOrder = () => setOrders([...orders, `order-${orders.length + 1}`]);",
+    "  const openSource = () => { void showSource(); };",
+    ...(lateThrowMessage === undefined ? [] : [`  const breakCurrent = () => { setTimeout(() => { throw new Error(${JSON.stringify(lateThrowMessage)}); }, 0); };`]),
+    '  return <main data-agent-react-build={"' + label + '"}>',
+    "    <h1>Orders AgentReact</h1>",
+    '    <p data-agent-react-label>{"' + label + '"}</p>',
+    "    <output aria-label=\"Order count\">{orders.length}</output>",
+    "    <button type=\"button\" onClick={addOrder}>Add order</button>",
+    "    <button type=\"button\" onClick={openSource}>Show source</button>",
+    ...(lateThrowMessage === undefined ? [] : ['    <button type="button" onClick={breakCurrent}>Break current</button>']),
+    "  </main>;",
+    "}",
+    "export default defineArtifactView({",
+    '  id: "orders",',
+    '  state: { "/orders": { schema: "list", version: 1 } },',
+    '  capabilities: ["studio.show-source"],',
+    "  component: Orders,",
+    "});",
+    "",
+  ].join("\n");
 }
 
 async function openArtifacts(page) {
@@ -277,6 +379,176 @@ test("keeps an unactivated Canvas TSX file on the Studio React fallback", async 
     format: "cursor-canvas-tsx",
     renderer: { id: "studio.react-preview", type: "sandboxed-web", status: "ready" },
   });
+  expect(failures).toEqual([]);
+});
+
+test("runs explicit AgentReact end to end and commits only a verified staging build", async ({ page }, testInfo) => {
+  test.setTimeout(60_000);
+  const failures = watchFailures(page);
+  await page.addInitScript(() => {
+    globalThis.__agentReactObservations = [];
+    addEventListener("harness.artifact-observation", (event) => globalThis.__agentReactObservations.push(event.detail));
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openArtifacts(page);
+  await page.getByRole("button", { name: /orders\.agent\.canvas\.tsx/ }).click();
+
+  const liveFrame = page.locator('iframe[title="Live AgentReact preview: orders.agent.canvas.tsx"]');
+  const live = page.frameLocator('iframe[title="Live AgentReact preview: orders.agent.canvas.tsx"]');
+  await expect(live.locator("h1")).toHaveText("Orders AgentReact", { timeout: 15_000 });
+  await expect(live.locator("[data-agent-react-label]")).toHaveText("first verified build");
+  await expect(live.locator("[data-artifact-node]").first()).toBeVisible();
+  await expect(page.getByText("AgentReact build committed from isolated staging.")).toBeVisible();
+  await page.locator(".studio-language-toggle").click();
+  await expect(page.getByRole("tab", { name: "预览" })).toBeVisible();
+  await expect(page.getByText("AgentReact 构建已从隔离暂存环境提交。")).toBeVisible();
+  await expect(page.locator('iframe[title="实时 AgentReact 预览：orders.agent.canvas.tsx"]')).toBeVisible();
+  await page.locator(".studio-language-toggle").click();
+  await expect(page.getByText("AgentReact build committed from isolated staging.")).toBeVisible();
+  await expect(liveFrame).toHaveAttribute("sandbox", "allow-scripts");
+  await expect(liveFrame).toHaveAttribute("referrerpolicy", "no-referrer");
+  const previewUri = await liveFrame.getAttribute("src");
+  const previewResponse = await page.request.get(`${studio.url}${previewUri}`);
+  expect(previewResponse.headers()["cache-control"]).toBe("private, max-age=31536000, immutable");
+  expect(previewResponse.headers()["content-security-policy"]).toContain("default-src 'none'");
+  expect(previewResponse.headers()["content-security-policy"]).toContain("connect-src 'none'");
+
+  const catalog = await (await page.request.get(`${studio.url}/api/artifacts`)).json();
+  expect(catalog.artifacts.find((artifact) => artifact.label === "orders.agent.canvas.tsx")).toMatchObject({
+    format: "agent-react-tsx",
+    renderer: { id: "studio.agent-react-preview", type: "sandboxed-web", status: "ready" },
+    capabilities: expect.arrayContaining(["actions", "execute", "live-update", "state"]),
+  });
+
+  const direct = await page.context().newPage();
+  await direct.goto(`${studio.url}${previewUri}`);
+  await expect(direct.getByRole("heading", { name: "Orders AgentReact" })).toHaveCount(0);
+  await direct.close();
+
+  await live.getByRole("button", { name: "Add order" }).click();
+  await expect(live.getByLabel("Order count")).toHaveText("1");
+  const firstBuildUri = await liveFrame.getAttribute("src");
+
+  try {
+    await writeFile(join(artifactDirectory, "orders.agent.canvas.tsx"), agentReactSource("must not commit", "staging exploded"), "utf8");
+    await expect(page.locator(".artifact-runtime-status")).toContainText("staging exploded", { timeout: 15_000 });
+    await expect(page.locator(".artifact-runtime-status")).toContainText("Current remains on the last verified build.");
+    await expect(live.locator("[data-agent-react-label]")).toHaveText("first verified build");
+    await expect(live.getByLabel("Order count")).toHaveText("1");
+    await expect(liveFrame).toHaveAttribute("src", firstBuildUri);
+
+    await writeFile(join(artifactDirectory, "orders.agent.canvas.tsx"), agentReactSource("second verified build"), "utf8");
+    await expect(live.locator("[data-agent-react-label]")).toHaveText("second verified build", { timeout: 15_000 });
+    await expect(live.getByLabel("Order count")).toHaveText("1");
+    await expect(liveFrame).not.toHaveAttribute("src", firstBuildUri);
+    await expect(page.getByText("AgentReact build committed from isolated staging.")).toBeVisible();
+
+    await writeFile(join(artifactDirectory, "orders.agent.canvas.tsx"), agentReactSource("interactive failure build", undefined, "current exploded"), "utf8");
+    await expect(live.locator("[data-agent-react-label]")).toHaveText("interactive failure build", { timeout: 15_000 });
+    await live.getByRole("button", { name: "Break current" }).click();
+    await expect(page.locator(".artifact-runtime-status")).toContainText("current exploded");
+    await expect(page.getByRole("tab", { name: "Source", exact: true })).toHaveAttribute("aria-selected", "true");
+    await expect(liveFrame).toHaveCount(0);
+
+    await writeFile(join(artifactDirectory, "orders.agent.canvas.tsx"), agentReactSource("recovered current build"), "utf8");
+    await expect(page.getByText("AgentReact build committed from isolated staging.")).toBeVisible({ timeout: 15_000 });
+    await page.locator(".artifact-runtime-tabs").getByRole("tab", { name: "Preview", exact: true }).click();
+    await expect(live.locator("[data-agent-react-label]")).toHaveText("recovered current build");
+    await expect(live.getByLabel("Order count")).toHaveText("1");
+
+    const observations = await page.evaluate(() => globalThis.__agentReactObservations);
+    expect(observations.length).toBeGreaterThanOrEqual(5);
+    expect(observations.map((entry) => entry?.value?.kind)).toEqual(expect.arrayContaining([
+      "renderCompleted",
+      "renderFailed",
+    ]));
+    expect(observations.every((entry, index) => entry.type === "CUSTOM"
+      && entry.name === "harness.artifact-observation"
+      && entry.value.sequence === index + 1
+      && typeof entry.value.artifactDigest === "string"
+      && typeof entry.value.buildDigest === "string")).toBe(true);
+
+    await live.getByRole("button", { name: "Show source" }).click();
+    await expect(page.getByRole("tab", { name: "Source", exact: true })).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator('[data-artifact-code-view="source"]')).toContainText("recovered current build");
+    await page.screenshot({ path: testInfo.outputPath("agent-react-source-action.png"), fullPage: true });
+  } finally {
+    await writeFile(join(artifactDirectory, "orders.agent.canvas.tsx"), agentReactSource("first verified build"), "utf8");
+  }
+  expect(failures).toEqual(["current exploded"]);
+});
+
+test("keeps the current AgentReact session across unrelated artifact invalidations", async ({ page }) => {
+  const failures = watchFailures(page);
+  await openArtifacts(page);
+  await page.getByRole("button", { name: /orders\.agent\.canvas\.tsx/ }).click();
+
+  const live = page.frameLocator('iframe[title="Live AgentReact preview: orders.agent.canvas.tsx"]');
+  const status = page.locator(".artifact-runtime-status");
+  await expect(live.getByRole("heading", { name: "Orders AgentReact" })).toBeVisible({ timeout: 15_000 });
+  await expect(status).toContainText("AgentReact build committed from isolated staging.");
+  await live.getByRole("button", { name: "Add order" }).click();
+  await expect(live.getByLabel("Order count")).toHaveText("1");
+
+  const catalog = await (await page.request.get(`${studio.url}/api/artifacts`)).json();
+  const snapshotUri = catalog.artifacts.find((artifact) => artifact.label === "orders.agent.canvas.tsx")?.build?.snapshotUri;
+  expect(snapshotUri).toBeTruthy();
+  try {
+    for (const text of ["unrelated invalidation one\n", "unrelated invalidation two\n"]) {
+      const refreshed = page.waitForResponse((response) => response.request().method() === "GET"
+        && new URL(response.url()).pathname === snapshotUri);
+      await writeFile(join(artifactDirectory, "notes.txt"), text, "utf8");
+      await refreshed;
+      await expect(status).toContainText("AgentReact build committed from isolated staging.");
+      await expect(live.getByLabel("Order count")).toHaveText("1");
+    }
+
+    await live.getByRole("button", { name: "Add order" }).click();
+    await expect(live.getByLabel("Order count")).toHaveText("2");
+    await live.getByRole("button", { name: "Show source" }).click();
+    await expect(page.getByRole("tab", { name: "Source", exact: true })).toHaveAttribute("aria-selected", "true");
+    await page.locator(".artifact-runtime-tabs").getByRole("tab", { name: "Preview", exact: true }).click();
+    await expect(live.getByLabel("Order count")).toHaveText("2");
+  } finally {
+    await writeFile(join(artifactDirectory, "notes.txt"), "followed the declared content reference\n", "utf8");
+  }
+  expect(failures).toEqual([]);
+});
+
+test("keeps AgentReact Preview primary at wide, compact, and narrow widths", async ({ page }, testInfo) => {
+  const failures = watchFailures(page);
+  for (const layout of [
+    { name: "wide", width: 1440, height: 900 },
+    { name: "compact", width: 1024, height: 768 },
+    { name: "narrow", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({ width: layout.width, height: layout.height });
+    await openArtifacts(page);
+    await page.getByRole("button", { name: /orders\.agent\.canvas\.tsx/ }).click();
+    const live = page.frameLocator('iframe[title="Live AgentReact preview: orders.agent.canvas.tsx"]');
+    await expect(live.getByRole("heading", { name: "Orders AgentReact" })).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator(".artifact-runtime-tabs").getByRole("tab", { name: "Preview", exact: true })).toHaveAttribute("aria-selected", "true");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1), `${layout.name} AgentReact preview overflows horizontally`).toBe(false);
+    await page.locator(".artifact-runtime-tabs").getByRole("tab", { name: "Source" }).focus();
+    expect(Number.parseFloat(await page.locator(".artifact-runtime-tabs").getByRole("tab", { name: "Source" }).evaluate((element) => getComputedStyle(element).outlineWidth))).toBeGreaterThan(0);
+    await page.screenshot({ path: testInfo.outputPath(`agent-react-${layout.name}.png`), fullPage: true });
+  }
+  expect(failures).toEqual([]);
+});
+
+test("commits AgentReact when preview paint callbacks are suspended", async ({ page }) => {
+  const failures = watchFailures(page);
+  await page.addInitScript(() => {
+    if (location.pathname.includes("/api/artifacts/") && location.pathname.endsWith("/preview")) {
+      globalThis.requestAnimationFrame = () => 1;
+    }
+  });
+  await openArtifacts(page);
+  await page.getByRole("button", { name: /orders\.agent\.canvas\.tsx/ }).click();
+
+  const live = page.frameLocator('iframe[title="Live AgentReact preview: orders.agent.canvas.tsx"]');
+  await expect(live.getByRole("heading", { name: "Orders AgentReact" })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("AgentReact build committed from isolated staging.")).toBeVisible();
   expect(failures).toEqual([]);
 });
 
@@ -850,11 +1122,11 @@ test("opens a project workspace and compares Inspector-discovered Sessions", asy
   const requestedUrls = [];
   page.on("request", (request) => requestedUrls.push(request.url()));
   await page.goto(emptyStudio.url);
-  const gate = page.getByRole("dialog", { name: "Open a workspace to start" });
+  const gate = page.getByRole("dialog", { name: "Open a Project to start" });
   await expect(gate).toBeVisible();
   await expect(page.locator(".studio-control-plane")).toHaveAttribute("inert", "");
   await expect(page.locator(".studio-control-plane")).toHaveAttribute("aria-hidden", "true");
-  await expect(page.getByRole("button", { name: "Choose workspace" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Choose Project" })).toBeVisible();
 
   for (const layout of [
     { name: "wide", width: 1440, height: 900 },
@@ -869,19 +1141,26 @@ test("opens a project workspace and compares Inspector-discovered Sessions", asy
   }
 
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.getByRole("button", { name: "Choose workspace" }).click();
-  await expect(page.getByRole("button", { name: "Opening workspace" })).toBeDisabled();
-  await expect(page.locator(".workspace-open-progress")).toContainText("Finding matching Sessions across local providers");
+  await page.getByRole("button", { name: "Choose Project" }).click();
+  await expect(page.getByRole("button", { name: "Opening Project" })).toBeDisabled();
+  await expect(page.locator(".workspace-open-progress")).toContainText("Finding matching Project Sessions across local providers");
   await expect(page.locator(".workspace-open-progress > i")).toHaveCSS("animation-name", "workspace-progress-spin");
   await page.screenshot({ path: "test-results/session-workspace-loading-wide.png", fullPage: true });
 
   await expect(gate).toHaveCount(0);
   await expect(page.locator(".studio-control-plane")).not.toHaveAttribute("inert", "");
-  await expect(page).toHaveURL(/#\/sessions$/);
+  await expect(page).toHaveURL(/#\/projects\/project_[a-f0-9]{32}\/overview$/u);
+  await page.getByRole("navigation", { name: "Studio project and View navigation" }).getByRole("button", { name: /^Sessions/ }).click();
+  await expect(page).toHaveURL(/#\/projects\/project_[a-f0-9]{32}\/sessions$/u);
   const inspector = page.locator("[data-studio-native-inspector]");
   await expect(inspector).toBeVisible();
   await expect(inspector).toHaveAttribute("data-react-inspector-workbench", "true");
   await expect(inspector.getByRole("tab", { name: "Date" })).toHaveAttribute("aria-selected", "true");
+  const inspectorCalendar = inspector.getByRole("group", { name: /evidence calendar/u });
+  await expect(inspectorCalendar).toBeVisible();
+  expect(await inspectorCalendar.locator(".date-cell").count()).toBeGreaterThanOrEqual(35);
+  expect(await inspectorCalendar.locator(".date-cell").count() % 7).toBe(0);
+  await expect(inspector.getByRole("button", { name: "Next month" })).toBeDisabled();
   await expect(inspector.getByRole("button", { name: "Open session" }).first()).toBeVisible();
   expect(requestedUrls.some((url) => url.endsWith("/assets/inspector-workbench.js"))).toBe(false);
   const openSessionButton = inspector.getByRole("button", { name: "Open session" }).first();
@@ -897,8 +1176,116 @@ test("opens a project workspace and compares Inspector-discovered Sessions", asy
   await expect(inspector.getByRole("region", { name: "Turn 1 outcome" })).toContainText("Outcome");
   await inspector.getByRole("button", { name: "Expand process" }).click();
   await expect(inspector.locator("details.session-process")).toHaveAttribute("open", "");
+  await expect(inspector.locator(".session-event.usage")).toHaveCount(2);
+  await expect(inspector.locator(".session-event.usage").first()).toContainText("98 total");
+  await expect(inspector.locator(".session-event.usage").first()).toContainText("25 / 100 · 25% full");
   await inspector.locator("details.session-filter-disclosure > summary").click();
   await expect(inspector.getByRole("checkbox", { name: /Tool calls/u })).toBeChecked();
+  const usageSummary = inspector.locator(".session-usage-summary");
+  await expect(usageSummary).toContainText(/Provider total\s*198/u);
+  await expect(usageSummary).toContainText(/Current context\s*40/u);
+  await expect(usageSummary).toContainText("40 / 100");
+  const modelValue = inspector.locator(".session-outline-facts dd[title]");
+  await expect(modelValue).toHaveAttribute("title", "claude-4.5-sonnet, claude-fable-5, claude-fable-5-thinking-high, composer-2.5-fast");
+  for (const layout of [
+    { name: "wide", width: 1440, height: 900 },
+    { name: "compact", width: 1024, height: 768 },
+    { name: "narrow", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({ width: layout.width, height: layout.height });
+    const measurement = {
+      documentOverflow: await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth),
+      outlineOverflow: await inspector.locator(".session-sidebar").evaluate((outline) => outline.scrollWidth - outline.clientWidth),
+      primaryRatio: await inspector.locator(".session-notebook-main").evaluate((primary) => primary.getBoundingClientRect().width / window.innerWidth),
+    };
+    expect(measurement.documentOverflow, `${layout.name} Session detail document overflow`).toBeLessThanOrEqual(1);
+    expect(measurement.outlineOverflow, `${layout.name} Session outline overflow`).toBeLessThanOrEqual(1);
+    if (layout.name === "wide") expect(measurement.primaryRatio).toBeGreaterThanOrEqual(0.5);
+    await page.screenshot({ path: `test-results/session-detail-trace-${layout.name}.png`, fullPage: true });
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await usageSummary.getByRole("button", { name: "View report" }).click();
+  await expect(page).toHaveURL(/inspector-view=usage/u);
+  const usageReport = inspector.getByRole("region", { name: "Usage report" });
+  await expect(usageReport).not.toContainText("Usage and Context Report");
+  await expect(usageReport).not.toContainText("Read-only evidence");
+  await expect(usageReport).not.toContainText("Unique model responses, absolute context progression");
+  await expect(usageReport).toContainText(/Net vs baseline\s*\+15/u);
+  await expect(usageReport).toContainText(/Model calls\s*2/u);
+  await expect(usageReport).toContainText(/Provider reported 1 compaction boundary\./u);
+  await expect(usageReport.locator(".usage-report-occupancy .usage-summary-compactions")).toHaveText("1 compaction");
+  await expect(usageReport.locator(".usage-report-occupancy .usage-context-bar")).toBeVisible();
+  await expect(usageReport.locator(".usage-report-reuse-tile")).toContainText(/Input reused\s*rate unavailable\s*90 cached/u);
+  await expect(usageReport.locator(".usage-reuse-section")).toHaveCount(0);
+  await expect(usageReport.getByRole("heading", { name: "Current context composition" })).toHaveCount(0);
+  await expect(usageReport.getByRole("img", { name: "Complete retained context progression" })).toBeVisible();
+  await expect(usageReport.getByRole("img", { name: /Focused context progression for responses 1 through 2/u })).toBeVisible();
+  await expect(usageReport.locator(".usage-overview-handle")).toHaveCount(2);
+  await expect(usageReport.locator(".usage-overview-turn")).toHaveCount(1);
+  await expect(usageReport.locator("[data-usage-overview-turn-marker]")).toHaveCount(1);
+  await expect(usageReport.locator("[data-usage-overview-turn-marker] title")).toContainText(/Repair (parser|renderer)[\s\S]*Response 1/u);
+  await expect(usageReport.locator(".usage-overview-prompt-tooltip")).toContainText(/Repair (parser|renderer)[\s\S]*Response 1/u);
+  await expect(usageReport.locator(".usage-overview-turn-label")).toHaveText("T1");
+  await expect(usageReport.locator(".usage-overview-turn-chip")).toHaveCount(1);
+  await expect(usageReport.locator("[data-usage-prompt-marker]")).toHaveCount(0);
+  await expect(usageReport.locator("[data-usage-overview-chart]")).toHaveAttribute("tabindex", "0");
+  await expect(usageReport.locator(".usage-overview .chart-toolbar")).toContainText(/Overview · 2 responses · 1 linked prompts/iu);
+  await expect(usageReport.locator(".usage-overview .chart-toolbar")).toContainText(/10:00:01 → 10:00:02 UTC|11:00:01 → 11:00:02 UTC/u);
+  const promptMarker = usageReport.locator("[data-usage-overview-turn-marker]");
+  await expect(promptMarker).not.toHaveAttribute("tabindex", /.+/u);
+  await promptMarker.locator(".usage-overview-turn-hit").hover();
+  await expect(usageReport.locator(".usage-overview-prompt-tooltip")).toHaveCSS("opacity", "1");
+  await promptMarker.locator(".usage-overview-turn-hit").click();
+  await expect(usageReport.locator(".usage-response-detail")).toContainText(/Response 1/u);
+  await expect(usageReport.locator(".usage-response-detail")).toContainText(/Context\s*25/u);
+  await expect(usageReport.locator(".usage-response-row[aria-selected='true']")).toContainText(/Response 1/u);
+  await expect(usageReport.locator(".usage-response-head")).not.toContainText("Turn");
+  await expect(usageReport.locator(".usage-chart-legend")).not.toContainText("User turn");
+  const selectedRow = usageReport.locator(".usage-response-row[aria-selected='true']");
+  await selectedRow.focus();
+  await selectedRow.press("ArrowDown");
+  await expect(usageReport.locator(".usage-response-detail")).toContainText(/Response 2/u);
+  await expect(usageReport.locator(".usage-response-prompt")).toContainText(/Linked user prompt · T1\s*Repair (parser|renderer)/u);
+  await expect(usageReport.locator(".usage-response-row[aria-selected='true']")).toContainText(/Response 2/u);
+  const focusChart = usageReport.getByRole("img", { name: /Focused context progression/u });
+  await focusChart.focus();
+  await focusChart.press("Escape");
+  await expect(usageReport.locator(".usage-response-row[aria-selected='true']")).toHaveCount(0);
+  await focusChart.press("Enter");
+  await expect(usageReport.locator(".usage-response-detail")).toContainText(/Response 1/u);
+  await expect(usageReport.locator(".usage-response-table")).toContainText(/(10|11):00:02/u);
+  await expect(usageReport.locator(".usage-report-occupancy .usage-context-bar i")).toHaveCount(3);
+  await expect(usageReport.locator(".usage-report-summary > .usage-report-occupancy")).toHaveCount(1);
+  await expect(usageReport.locator(".usage-report-summary > .usage-report-lead-facts > div")).toHaveCount(5);
+  const evidenceDetails = usageReport.locator(".usage-report-lead > .usage-report-evidence");
+  await expect(evidenceDetails).toBeVisible();
+  await expect(evidenceDetails.locator("header, .usage-evidence-status")).toHaveCount(0);
+  await expect(evidenceDetails.locator("summary")).toHaveCount(0);
+  await expect(evidenceDetails.locator(".usage-evidence-groups")).toBeVisible();
+  await expect(evidenceDetails.locator(".usage-evidence-group")).toHaveCount(4);
+  await expect(evidenceDetails).toContainText(/Coverage\s*observed/u);
+  await expect(evidenceDetails).toContainText(/Observability[\s\S]*Runtime[\s\S]*Accounting[\s\S]*Provenance/u);
+  await expect(evidenceDetails).toContainText(/Raw context\s*omitted/u);
+  await expect(usageReport.getByRole("img", { name: "Context structure by observed item count: 3 items across 2 layers" })).toBeVisible();
+  await expect(usageReport.locator(".usage-structure-list")).toContainText(/developer-message\s*×2/u);
+  await expect(usageReport.locator(".usage-structure-list")).toContainText(/skills\s*×1/u);
+  await expect(usageReport.locator(".usage-structure-section")).toContainText("token sizes unavailable");
+  await expect(usageReport.locator(".usage-structure-list")).not.toContainText("%");
+  for (const layout of [
+    { name: "wide", width: 1440, height: 900 },
+    { name: "compact", width: 1024, height: 768 },
+    { name: "narrow", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({ width: layout.width, height: layout.height });
+    if (layout.width <= 1080) await expect(page.locator(".studio-primary-nav")).not.toBeInViewport();
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);
+    expect(overflow, `${layout.name} usage and context detail overflows horizontally`).toBe(false);
+    await page.screenshot({ path: `test-results/session-detail-usage-${layout.name}.png`, fullPage: true });
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await inspector.getByRole("button", { name: "Back to Trace" }).click();
+  await expect(page).not.toHaveURL(/inspector-view=/u);
+  await expect(inspector.locator(".session-layout")).toBeVisible();
   await inspector.getByRole("tab", { name: "Replay" }).click();
   await expect(inspector.getByRole("tab", { name: /Events/u })).toHaveAttribute("aria-selected", "true");
   await expect(inspector.getByRole("tab", { name: /Files/u })).toBeVisible();
@@ -942,6 +1329,14 @@ test("opens a project workspace and compares Inspector-discovered Sessions", asy
   await expect(page.getByRole("button", { name: /Repair renderer/ })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Repair renderer" })).toBeVisible();
   await expect(page.locator(".session-event-rows")).toContainText("Bash");
+  const sessionDiff = page.getByRole("button", { name: "Open Session artifact review.diff" });
+  await expect(sessionDiff).toBeVisible();
+  await sessionDiff.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator('[data-native-session-artifact="review.diff"]')).toBeVisible();
+  await sessionDiff.dblclick();
+  await expect(page.locator('[data-native-session-artifact="review.diff"]')).toBeVisible();
+  await expect(page.locator('[data-native-session-artifact="review.diff"] [data-artifact-code-view="diff"]')).toContainText("native-file");
   for (const layout of [
     { name: "wide", width: 1440, height: 900 },
     { name: "compact", width: 1024, height: 768 },
@@ -955,11 +1350,24 @@ test("opens a project workspace and compares Inspector-discovered Sessions", asy
   }
 
   await page.setViewportSize({ width: 1440, height: 900 });
+  const sessionRows = page.locator(".session-catalog-rows > li > button");
+  await expect(sessionRows).toHaveCount(2);
+  await expect(page.locator('.session-catalog-rows > li > button[tabindex="0"]')).toHaveCount(1);
+  await sessionRows.first().focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(sessionRows.nth(1)).toBeFocused();
+  await page.keyboard.press("ArrowUp");
+  await expect(sessionRows.first()).toBeFocused();
+  await expect(page.getByRole("checkbox", { name: /Select Repair parser .* for comparison/u })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: /Select Repair renderer .* for comparison/u })).toBeVisible();
   const compareChecks = page.locator(".session-catalog-rows input[type=checkbox]");
   await compareChecks.nth(0).check();
   await compareChecks.nth(1).check();
   await page.getByRole("button", { name: "Compare 2/2" }).click();
   await expect(page.getByRole("heading", { name: "Compare Sessions" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Metric" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Left" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Right" })).toBeVisible();
   await expect(page.locator(".session-compare-boundary")).toContainText("No winner inferred");
   await expect(page.locator(".session-compare-workspace")).toContainText("Repair parser");
   await expect(page.locator(".session-compare-workspace")).toContainText("Repair renderer");
@@ -972,14 +1380,30 @@ test("opens a project workspace and compares Inspector-discovered Sessions", asy
     if (layout.width <= 1080) await expect(page.locator(".studio-primary-nav")).not.toBeInViewport();
     const overflows = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);
     expect(overflows, `${layout.name} session comparison overflows horizontally`).toBe(false);
+    if (layout.name === "narrow") {
+      const metricLayout = await page.evaluate(() => {
+        const table = document.querySelector(".session-compare-table");
+        const cells = [...document.querySelectorAll(".session-compare-table [role=cell]")];
+        return {
+          tableClient: table?.clientWidth ?? 0,
+          tableScroll: table?.scrollWidth ?? Infinity,
+          cells: cells.map((cell) => {
+            const rect = cell.getBoundingClientRect();
+            return { left: rect.left, right: rect.right };
+          }),
+        };
+      });
+      expect(metricLayout.tableScroll).toBeLessThanOrEqual(metricLayout.tableClient + 1);
+      expect(metricLayout.cells.every((cell) => cell.left >= 0 && cell.right <= layout.width + 1)).toBe(true);
+    }
     await page.screenshot({ path: `test-results/session-compare-${layout.name}.png`, fullPage: true });
   }
 
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.getByRole("navigation", { name: "Harness control plane" }).getByRole("button", { name: /^Debugger/ }).click();
-  await expect(page.getByText("Workspace default · Qoder", { exact: true })).toBeVisible();
+  await page.getByRole("navigation", { name: "Studio project and View navigation" }).getByRole("button", { name: /^Debugger/ }).click();
+  await expect(page.getByText(/Project default · Qoder · fixture-project/u)).toBeVisible();
   await page.getByRole("button", { name: "New live run" }).click();
-  await expect(page.getByRole("dialog", { name: "Start a live harness session" })).toContainText("selected workspace");
+  await expect(page.getByRole("dialog", { name: "Start a live harness session" })).toContainText("Project fixture-project");
   await page.getByPlaceholder("Task prompt for the harness run…").fill("verify the default workspace harness");
   await page.getByRole("button", { name: "Run harness" }).click();
   await expect(page.locator(".session-notebook")).toContainText("default harness: verify the default workspace harness");

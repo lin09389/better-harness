@@ -1,6 +1,15 @@
 import path from "node:path";
 
 import { redactTranscriptText } from "../commit-session-link/index.mjs";
+import {
+  deriveCacheReuse,
+  observedCacheAccountingMode,
+  observedContextUsage,
+  observedProcessingAccounting,
+  observedTokenUsage,
+  projectCacheReuse,
+  projectUsageReport,
+} from "../session-analysis/index.mjs";
 import { emptyFeatureTree } from "./feature-tree.mjs";
 
 export const HARNESS_INSPECTOR_REPORT_KIND = "HarnessInspectorReportV1";
@@ -259,6 +268,24 @@ function projectDialogue(dialogue, toolActivity) {
         const text = safeText(step.text, 400);
         return text ? { kind: "note", text } : null;
       }
+      if (step?.kind === "usage") {
+        const tokenUsage = observedTokenUsage(step.tokenUsage);
+        const contextUsage = projectContextWindowUsage(step.contextUsage);
+        const processing = observedProcessingAccounting(step, { boundText: safeText });
+        const cacheReuse = projectCacheReuse(step.cacheReuse);
+        if (!tokenUsage && !contextUsage && !processing.processedTokens) return null;
+        return {
+          kind: "usage",
+          ...(tokenUsage ? { tokenUsage } : {}),
+          ...(contextUsage ? { contextUsage } : {}),
+          ...(cacheReuse ? { cacheReuse } : {}),
+          ...(step.basis ? { basis: safeText(step.basis, 40) } : {}),
+          ...(step.source ? { source: safeText(step.source, 80) } : {}),
+          ...(step.model ? { model: safeText(step.model, 80) } : {}),
+          ...processing,
+          timestamp: step.timestamp ?? null,
+        };
+      }
       if (step?.kind !== "tool") return null;
       const callStep = Number(step.callStep);
       const call = callsByStep.get(callStep);
@@ -283,6 +310,12 @@ function projectDialogue(dialogue, toolActivity) {
     const intermediateCount = Number.isInteger(turn?.intermediateCount)
       ? turn.intermediateCount
       : steps.filter((step) => step.kind === "note").length;
+    const usageEventCount = Number.isInteger(turn?.usageEventCount)
+      ? turn.usageEventCount
+      : steps.filter((step) => step.kind === "usage").length;
+    const derivedEventCount = intermediateCount
+      + steps.filter((step) => step.kind === "tool").length
+      + usageEventCount;
     return {
       index: Number(turn?.index) || index + 1,
       anchorId: `turn-${Number(turn?.index) || index + 1}`,
@@ -291,9 +324,10 @@ function projectDialogue(dialogue, toolActivity) {
       toolCallCount: Number(turn?.toolCallCount) || steps.filter((step) => step.kind === "tool").length,
       messageCount: Number(turn?.messageCount) || 0,
       intermediateCount,
+      usageEventCount,
       eventCount: Number.isInteger(turn?.eventCount)
-        ? turn.eventCount
-        : intermediateCount + steps.filter((step) => step.kind === "tool").length,
+        ? Math.max(turn.eventCount, derivedEventCount)
+        : derivedEventCount,
       shownEventCount: Number.isInteger(turn?.shownEventCount) ? turn.shownEventCount : steps.length,
       processTruncated: turn?.processTruncated === true,
       response,
@@ -339,6 +373,52 @@ function bindPromptsToTurns(prompts, turns) {
   });
 }
 
+function timestampMs(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+// Usage points and Turns are independent projections of the same transcript.
+// Join them only through observed time containment; response ordinal and array
+// position are intentionally not fallbacks because compaction and sampling can
+// make those sequences diverge.
+function bindUsageProgressionToTurns(usageReport, dialogue) {
+  const turns = dialogue?.turns ?? [];
+  const windows = turns.map((turn, index) => {
+    const promptMs = timestampMs(turn.prompt?.timestamp);
+    const startCandidates = [turn.startMs, promptMs].filter(Number.isFinite);
+    const startMs = startCandidates.length ? Math.min(...startCandidates) : null;
+    const nextPromptMs = timestampMs(turns[index + 1]?.prompt?.timestamp);
+    const nextStartMs = Number.isFinite(turns[index + 1]?.startMs) ? turns[index + 1].startMs : nextPromptMs;
+    const endCandidates = [turn.endMs, nextStartMs].filter((value) => Number.isFinite(value) && (startMs === null || value >= startMs));
+    return {
+      turn,
+      startMs,
+      endMs: endCandidates.length ? Math.min(...endCandidates) : null,
+    };
+  }).filter((window) => window.startMs !== null && window.endMs !== null);
+  const firstPointByTurn = new Set();
+  const progression = usageReport.progression.map((point) => {
+    const pointMs = timestampMs(point.timestamp);
+    if (pointMs === null) return point;
+    // Prefer the latest matching start at a shared boundary, so an event at the
+    // next prompt timestamp belongs to the new Turn rather than the prior one.
+    const window = [...windows].reverse().find((candidate) => pointMs >= candidate.startMs && pointMs <= candidate.endMs);
+    if (!window) return point;
+    const prompt = safeText(window.turn.prompt?.text, 240);
+    const promptBoundary = !firstPointByTurn.has(window.turn.index);
+    firstPointByTurn.add(window.turn.index);
+    return {
+      ...point,
+      turnIndex: window.turn.index,
+      ...(promptBoundary && prompt ? { userPrompt: prompt } : {}),
+      ...(promptBoundary ? { promptBoundary: true } : {}),
+    };
+  });
+  return { ...usageReport, progression };
+}
+
 // One turn vocabulary for every surface. `turnCount` is the number of dialogue
 // Turns a reviewer can actually open; the other counts explain why fewer prompt
 // cards are shown, so no two views can quote different totals.
@@ -356,6 +436,64 @@ function turnCoverage(session, prompts, dialogue) {
   };
 }
 
+function nonNegativeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function projectTokenUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const projected = {};
+  for (const field of ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "reasoningOutputTokens", "totalTokens"]) {
+    if (Object.hasOwn(usage, field)) projected[field] = nonNegativeNumber(usage[field]);
+  }
+  projected.basis = safeText(usage.basis, 40, "model-inference");
+  projected.source = safeText(usage.source, 80, "normalized-session-events");
+  projected.coverage = ["observed", "partial", "unobserved"].includes(usage.coverage)
+    ? usage.coverage
+    : "observed";
+  const cacheAccountingMode = observedCacheAccountingMode(usage.cacheAccountingMode);
+  if (cacheAccountingMode) projected.cacheAccountingMode = cacheAccountingMode;
+  return projected;
+}
+
+// Binds this surface's redactor to the shared occupancy normalizer.
+function projectContextWindowUsage(usage) {
+  return observedContextUsage(usage, { boundText: safeText });
+}
+
+function projectRuntime(runtime) {
+  if (!runtime || typeof runtime !== "object") return null;
+  const projected = Object.fromEntries(["modelProvider", "cliVersion", "effort"]
+    .map((field) => [field, safeText(runtime[field], 80)])
+    .filter(([_field, value]) => value));
+  return Object.keys(projected).length > 0 ? projected : null;
+}
+
+function projectContextManifest(manifest) {
+  if (!manifest || typeof manifest !== "object") return null;
+  const projected = {
+    status: ["observed", "partial", "unobserved"].includes(manifest.status) ? manifest.status : "partial",
+    source: safeText(manifest.source, 80, "normalized-context-events"),
+    rawTextOmitted: true,
+    compactionCount: Math.round(nonNegativeNumber(manifest.compactionCount)),
+    layers: (Array.isArray(manifest.layers) ? manifest.layers : []).slice(0, 16).map((layer) => ({
+      kind: safeText(layer?.kind, 80, "other"),
+      itemCount: Math.round(nonNegativeNumber(layer?.itemCount)),
+    })),
+    categories: (Array.isArray(manifest.categories) ? manifest.categories : []).slice(0, 20).map((category) => ({
+      kind: safeText(category?.kind, 80, "other"),
+      label: safeText(category?.label, 120, "Other"),
+      estimatedTokens: Math.round(nonNegativeNumber(category?.estimatedTokens)),
+    })),
+  };
+  if (manifest.usedTokens !== null && manifest.usedTokens !== undefined && Number.isFinite(Number(manifest.usedTokens))) projected.usedTokens = Math.round(nonNegativeNumber(manifest.usedTokens));
+  if (manifest.windowTokens !== null && manifest.windowTokens !== undefined && Number.isFinite(Number(manifest.windowTokens))) projected.windowTokens = Math.round(nonNegativeNumber(manifest.windowTokens));
+  if (manifest.percentFull !== null && manifest.percentFull !== undefined && Number.isFinite(Number(manifest.percentFull))) projected.percentFull = Math.min(100, Math.round(nonNegativeNumber(manifest.percentFull) * 10) / 10);
+  if (manifest.basis) projected.basis = safeText(manifest.basis, 40);
+  return projected;
+}
+
 function projectSession(session) {
   const sessionId = safeLocator(session.sessionId);
   if (!sessionId) return null;
@@ -366,12 +504,18 @@ function projectSession(session) {
     calls: toolTrace.calls.map((call) => ({ ...call, family: "other" })),
   });
   const dialogue = projectDialogue(session.dialogue, toolActivity);
+  const tokenUsage = projectTokenUsage(session.tokenUsage);
+  const cacheReuse = deriveCacheReuse(tokenUsage, tokenUsage?.cacheAccountingMode);
   const prompts = bindPromptsToTurns((session.prompts ?? []).map((prompt, index) => ({
     id: `${sessionId}:prompt:${index + 1}`,
     text: safeText(prompt.text, 500, "Prompt unavailable after privacy filtering"),
     timestamp: prompt.timestamp ?? null,
     day: isoDay(prompt.timestamp ?? session.firstSeen),
   })), dialogue.turns);
+  const usageReport = bindUsageProgressionToTurns(projectUsageReport(session.usageReport, {
+    providerTotalTokens: tokenUsage?.totalTokens ?? null,
+    boundText: safeText,
+  }), dialogue);
   return {
     sessionId,
     locator,
@@ -391,11 +535,17 @@ function projectSession(session) {
     assistantMessageCount: Number(session.assistantMessageCount) || 0,
     fileEditCount: Number(session.fileEditCount) || 0,
     models: (session.models ?? []).map((model) => safeText(model, 80)).filter(Boolean),
-    tokenUsage: session.tokenUsage && typeof session.tokenUsage === "object" ? {
-      inputTokens: Number(session.tokenUsage.inputTokens) || 0,
-      outputTokens: Number(session.tokenUsage.outputTokens) || 0,
-      cacheReadInputTokens: Number(session.tokenUsage.cacheReadInputTokens) || 0,
-    } : null,
+    tokenUsage,
+    ...(cacheReuse ? { cacheReuse } : {}),
+    // Bounded projection only. The Session that produced this report already
+    // counted every inference; recomputing here from the capped dialogue would
+    // quote a display artefact under the same field names.
+    usageReport,
+    runtime: projectRuntime(session.runtime),
+    contextManifest: projectContextManifest(session.contextManifest),
+    timestampBasis: ["native-event", "native-metadata", "source-file-mtime", "unobserved"].includes(session.timestampBasis)
+      ? session.timestampBasis
+      : "unobserved",
     toolTrace,
     toolActivity,
     dialogue,

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import type { CheckpointHistoryPreview, ResolvedHistoryDraftPreview } from "../../contracts/experiment-setup.js";
-import { applyLaneEvent, emptyLane, mergeCallPage } from "./experiment-comparison-model.js";
+import { useTranslation } from "react-i18next";
+import { isExperimentRunnable, type CheckpointHistoryPreview, type ResolvedHistoryDraftPreview } from "../../contracts/experiment-setup.js";
+import { applyLaneEvent, emptyLane, globalStreamFailure, mergeCallPage } from "./experiment-comparison-model.js";
 import { ExperimentBuilder, type HistoryActionState, type HistoryLoadState } from "./ExperimentBuilder.js";
 import { ExperimentWorkbench } from "./ExperimentWorkbench.js";
+import { SimpleCompareView } from "./SimpleCompareView.js";
 import { createSseParser } from "../sse-client.js";
 import type {
   CompareView,
@@ -13,13 +15,14 @@ import type {
   TraceLens,
 } from "./experiment-view-types.js";
 
-type ExperimentSurface = "builder" | "workbench";
+type ExperimentSurface = "simple" | "builder" | "workbench";
 type LoadState =
   | { phase: "loading" }
   | { phase: "error"; detail: string }
   | { phase: "ready"; preview: ExperimentPreview };
 
-export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JSX.Element {
+export function ExperimentView(props: { historyEnabled?: boolean; navigation?: ReactNode } = {}): React.JSX.Element {
+  const { t } = useTranslation("experiment");
   const [load, setLoad] = useState<LoadState>({ phase: "loading" });
   const [lanes, setLanes] = useState<Record<string, LaneTrace>>({});
   const [selection, setSelection] = useState<Selection | null>(null);
@@ -33,8 +36,14 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
   const [experimentId, setExperimentId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [compareSet, setCompareSet] = useState<StreamEvent["compareSet"]>();
-  const [surface, setSurface] = useState<ExperimentSurface>("builder");
-  const [history, setHistory] = useState<HistoryLoadState>({ phase: "loading" });
+  const [surface, setSurface] = useState<ExperimentSurface>("simple");
+  const [prompt, setPrompt] = useState("");
+  const [submittedPrompt, setSubmittedPrompt] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string>();
+  const [agentIds, setAgentIds] = useState<Record<string, string>>({});
+  const [history, setHistory] = useState<HistoryLoadState>(props.historyEnabled === false
+    ? { phase: "disabled" }
+    : { phase: "loading" });
   const [historyId, setHistoryId] = useState<string | null>(null);
   const [historyDraft, setHistoryDraft] = useState<ResolvedHistoryDraftPreview | null>(null);
   const [historyAction, setHistoryAction] = useState<HistoryActionState>({ phase: "idle" });
@@ -52,6 +61,10 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
         initializePreview(payload);
       } catch (error) {
         if (!cancelled) setLoad({ phase: "error", detail: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+      if (props.historyEnabled === false) {
+        setHistory({ phase: "disabled" });
         return;
       }
       try {
@@ -73,7 +86,7 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
       }
     })();
     return () => { cancelled = true; abortRef.current?.abort(); };
-  }, []);
+  }, [props.historyEnabled]);
 
   useEffect(() => {
     const media = globalThis.matchMedia?.("(max-width: 1080px)");
@@ -88,6 +101,7 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
     for (const lane of payload.manifest.lanes) {
       const calls = lane.origin === "observed" ? payload.observedCalls[lane.id] ?? [] : [];
       initial[lane.id] = {
+        ...emptyLane(),
         status: lane.origin === "observed" ? "history" : "idle",
         calls,
         eventCount: payload.observedCallPages?.[lane.id]?.parsedLines ?? calls.length,
@@ -104,6 +118,12 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
     setCandidateId(candidate?.id ?? baseline?.id ?? "");
     setCompareSet(undefined);
     setSelection(null);
+    setPrompt(payload.setup.request.prompt);
+    setSubmittedPrompt(null);
+    setRunError(undefined);
+    const acpHosted = payload.manifest.runtime?.host === "acp";
+    const defaultAgentId = acpHosted ? payload.acpAgents?.defaultAgentId ?? "" : "";
+    setAgentIds(acpHosted ? Object.fromEntries(fresh.map((lane) => [lane.id, defaultAgentId])) : {});
   }
 
   async function loadMoreCalls(laneId: string): Promise<void> {
@@ -166,7 +186,7 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
 
   async function lockBuilder(): Promise<void> {
     if (history.phase === "disabled") {
-      setSurface("workbench");
+      if (load.phase === "ready" && isExperimentRunnable(load.preview.setup)) setSurface("workbench");
       return;
     }
     if (history.phase !== "ready" || historyId === null || historyDraft?.selection.id !== historyId) return;
@@ -193,6 +213,17 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
 
   function applyStreamEvent(event: StreamEvent): void {
     if (event.compareSet !== undefined) setCompareSet(event.compareSet);
+    const globalFailure = globalStreamFailure(event);
+    if (globalFailure !== undefined) {
+      setRunError(globalFailure.detail);
+      setLanes((current) => Object.fromEntries(Object.entries(current).map(([laneId, lane]) => [
+        laneId,
+        lane.status === "history"
+          ? lane
+          : { ...lane, status: globalFailure.status, detail: globalFailure.detail, pendingPermissions: [] },
+      ])));
+      return;
+    }
     if (event.laneId === null) return;
     setLanes((current) => {
       const lane = current[event.laneId!] ?? emptyLane();
@@ -201,6 +232,12 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
   }
 
   async function runExperiment(): Promise<void> {
+    if (load.phase !== "ready" || !isExperimentRunnable(load.preview.setup)) {
+      setRunError(load.phase === "ready"
+        ? load.preview.setup.checkpointSource.limitation ?? "The checkpoint source cannot create isolated fresh runs."
+        : "Comparison setup is not ready.");
+      return;
+    }
     const nextId = `exp_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
     const controller = new AbortController();
     abortRef.current = controller;
@@ -208,6 +245,8 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
     setRunning(true);
     setCompareSet(undefined);
     setSelection(null);
+    setSubmittedPrompt(prompt);
+    setRunError(undefined);
     setLanes((current) => Object.fromEntries(Object.entries(current).map(([laneId, lane]) => [
       laneId,
       lane.status === "history" ? lane : emptyLane(),
@@ -216,7 +255,11 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
       const response = await fetch("api/experiment/runs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ experimentId: nextId }),
+        body: JSON.stringify({
+          experimentId: nextId,
+          prompt,
+          ...(load.preview.manifest.runtime?.host === "acp" ? { agentIds } : {}),
+        }),
         signal: controller.signal,
       });
       if (!response.ok || response.body === null) {
@@ -235,6 +278,7 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
       parser.end();
     } catch (error) {
       if (!controller.signal.aborted) {
+        setRunError(error instanceof Error ? error.message : String(error));
         setLanes((current) => Object.fromEntries(Object.entries(current).map(([laneId, lane]) => [
           laneId,
           lane.status === "running" || lane.status === "preparing"
@@ -255,12 +299,50 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
     setRunning(false);
     setLanes((current) => Object.fromEntries(Object.entries(current).map(([laneId, lane]) => [
       laneId,
-      lane.status === "running" || lane.status === "preparing" ? { ...lane, status: "cancelled" } : lane,
+      lane.status === "running" || lane.status === "preparing"
+        ? { ...lane, status: "cancelled", pendingPermissions: [] }
+        : lane,
     ])));
   }
 
-  if (load.phase === "loading") return <p>Loading comparison…</p>;
-  if (load.phase === "error") return <p className="warning">Cannot load comparison: {load.detail}</p>;
+  async function decidePermission(
+    laneId: string,
+    runId: string,
+    requestId: string,
+    optionId: string,
+  ): Promise<void> {
+    try {
+      const response = await fetch(
+        `api/acp/runs/${encodeURIComponent(runId)}/permissions/${encodeURIComponent(requestId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ optionId }),
+        },
+      );
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(payload.error ?? `Permission decision failed (${response.status}).`);
+      setLanes((current) => ({
+        ...current,
+        [laneId]: {
+          ...(current[laneId] ?? emptyLane()),
+          pendingPermissions: (current[laneId]?.pendingPermissions ?? [])
+            .filter((item) => item.requestId !== requestId),
+        },
+      }));
+    } catch (error) {
+      setLanes((current) => ({
+        ...current,
+        [laneId]: {
+          ...(current[laneId] ?? emptyLane()),
+          detail: error instanceof Error ? error.message : String(error),
+        },
+      }));
+    }
+  }
+
+  if (load.phase === "loading") return <p>{t("view.loading")}</p>;
+  if (load.phase === "error") return <p className="warning">{t("view.cannotLoad", { detail: load.detail })}</p>;
   const { preview } = load;
   const fresh = preview.manifest.lanes.filter((lane) => lane.origin === "execute");
   const focusedBaselineId = baselineId ?? fresh[0]?.id ?? "";
@@ -276,6 +358,28 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
       historyAction={historyAction}
       onSelectHistory={selectHistory}
       onLock={() => void lockBuilder()}
+    />;
+  }
+
+  if (surface === "simple") {
+    return <SimpleCompareView
+      preview={preview}
+      lanes={lanes}
+      baselineId={focusedBaselineId}
+      candidateId={focusedCandidateId}
+      prompt={prompt}
+      submittedPrompt={submittedPrompt}
+      running={running}
+      runError={runError}
+      agentIds={agentIds}
+      onPrompt={setPrompt}
+      onAgent={(laneId, agentId) => setAgentIds((current) => ({ ...current, [laneId]: agentId }))}
+      onRun={() => void runExperiment()}
+      onCancel={() => void cancelExperiment()}
+      onPermission={(laneId, runId, requestId, optionId) =>
+        void decidePermission(laneId, runId, requestId, optionId)}
+      onSetup={() => setSurface("builder")}
+      onAdvanced={() => setSurface("workbench")}
     />;
   }
 
@@ -305,11 +409,15 @@ export function ExperimentView(props: { navigation?: ReactNode } = {}): React.JS
     running={running}
     experimentId={experimentId}
     compareSet={compareSet}
+    agentIds={agentIds}
     railCollapsed={railCollapsed}
     onRailCollapsed={setRailCollapsed}
     onSetup={() => setSurface("builder")}
+    onSimple={() => setSurface("simple")}
     onRun={() => void runExperiment()}
     onCancel={() => void cancelExperiment()}
+    onPermission={(laneId, runId, requestId, optionId) =>
+      void decidePermission(laneId, runId, requestId, optionId)}
     onSelectRun={selectRun}
     onSelectCall={setSelection}
     onActiveView={setActiveView}

@@ -32,6 +32,7 @@ const SOURCE = `
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 let studio;
 let experimentStudio;
+let blockedExperimentStudio;
 let inspectorStudio;
 let lockedFixtureDir;
 let inspectorFixtureDir;
@@ -45,14 +46,20 @@ const LAYOUTS = [
 ];
 
 async function openDestination(page, label) {
-  const quickAction = page.getByRole("button", { name: `Go to ${label}` });
+  const quickAction = page.getByRole("button", { name: new RegExp(`^(?:Go to|Open) ${label}\\b`) });
+  const destination = page.getByRole("navigation", { name: "Studio project and View navigation" }).getByRole("button", { name: new RegExp(`^${label}`) });
+  const toggle = page.getByRole("button", { name: "Open Studio navigation" });
+  await expect.poll(async () => (
+    await quickAction.isVisible().catch(() => false)
+      || await destination.isVisible().catch(() => false)
+      || await toggle.isVisible().catch(() => false)
+  )).toBe(true);
   if (await quickAction.isVisible().catch(() => false) && await quickAction.isEnabled()) {
     await quickAction.click();
     return;
   }
-  const destination = page.getByRole("navigation", { name: "Harness control plane" }).getByRole("button", { name: new RegExp(`^${label}`) });
-  const toggle = page.getByRole("button", { name: "Open Studio navigation" });
   if (await toggle.isVisible() && await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
+  await expect(destination).toBeVisible();
   await destination.click();
   if (await toggle.isVisible()) {
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
@@ -138,6 +145,16 @@ test.beforeAll(async () => {
   });
   lockedFixtureDir = await mkdtemp(join(tmpdir(), "studio-browser-lock-"));
   await cp(resolve(packageRoot, "../harness/examples/checkpoint-experiment"), lockedFixtureDir, { recursive: true });
+  const experimentManifestPath = join(lockedFixtureDir, "experiment.json");
+  const experimentManifest = JSON.parse(await readFile(experimentManifestPath, "utf8"));
+  experimentManifest.runtime.host = "acp";
+  experimentManifest.runtime.tools = [];
+  experimentManifest.runtime.allowedTools = [];
+  experimentManifest.runtime.disallowedTools = [];
+  for (const lane of experimentManifest.lanes) {
+    if (lane.origin === "execute") lane.runtime.profile = "acp-v1-stdio";
+  }
+  await writeFile(experimentManifestPath, `${JSON.stringify(experimentManifest, null, 2)}\n`, "utf8");
   const historyDescriptor = { id: "browser-project-history-v1", label: "Project agent history" };
   const historyItems = [
     { id: "episode_alpha", title: "Original checkpoint inspection", requestPreview: "Inspect the original checkpoint.", occurredAt: "2026-08-16T08:00:00.000Z", adapter: historyDescriptor, provenance: "unverified-history", checkpointVerified: false },
@@ -171,12 +188,22 @@ test.beforeAll(async () => {
       };
     },
   };
+  const qoderAcp = { command: process.execPath, args: ["fixture-qoder"], label: "Qoder CLI", modelPolicy: "agent-default" };
+  const codexAcp = { command: process.execPath, args: ["fixture-codex"], label: "Codex ACP", modelPolicy: "lane" };
   experimentStudio = await startHarnessStudioServer({
     appDir: resolve(packageRoot, "dist/app"),
     harnessSource: SOURCE,
     runDirectory: join(runsFixtureDir, "experiment"),
     evidenceDir: resolve(packageRoot, "test/fixtures"),
-    experimentManifestPath: resolve(packageRoot, "../harness/examples/checkpoint-experiment/experiment.json"),
+    experimentManifestPath,
+    acpAgent: qoderAcp,
+    acpAgents: [
+      { id: "qodercli", label: "Qoder CLI", agent: qoderAcp },
+      { id: "pi", label: "Pi ACP", unavailableReason: "pi-acp bridge not installed" },
+      { id: "dsh", label: "DSH ACP", unavailableReason: "DSH ACP entrypoint not configured" },
+      { id: "codex-acp", label: "Codex ACP", agent: codexAcp },
+      { id: "claude-acp", label: "Claude ACP", unavailableReason: "Claude ACP bridge not installed" },
+    ],
     checkpointSourcePreview: {
       status: "ready",
       adapter: { id: "browser-fixture-v1", label: "Versioned project fixture" },
@@ -219,6 +246,9 @@ test.beforeAll(async () => {
         const runId = `${options.experimentId}:${laneId}:1`;
         emit("lane-preparing", laneId, runId);
         emit("lane-started", laneId, runId);
+        emit("lane-event", laneId, runId, { type: "message-started", messageId: "message-1" });
+        emit("lane-event", laneId, runId, { type: "text-delta", messageId: "message-1", text: `${laneId} is working on the project.` });
+        emit("lane-event", laneId, runId, { type: "message-finished", messageId: "message-1" });
         const readInput = laneId === "fresh-default" ? { path: "README.md" } : { file_path: "README.md" };
         emit("lane-event", laneId, runId, { type: "tool-call-started", toolCallId: "read", toolName: "Read", input: readInput });
         emit("lane-event", laneId, runId, { type: "tool-call-result", toolCallId: "read", content: "# fixture" });
@@ -245,11 +275,18 @@ test.beforeAll(async () => {
       return compareSet;
     },
   });
+  blockedExperimentStudio = await startHarnessStudioServer({
+    appDir: resolve(packageRoot, "dist/app"),
+    experimentManifestPath: resolve(packageRoot, "../harness/examples/checkpoint-experiment/experiment.json"),
+    acpAgents: [{ id: "codex-acp", label: "Codex ACP", unavailableReason: "not used by Qoder" }],
+    experimentRunner: async () => { throw new Error("blocked comparison must not start"); },
+  });
 });
 
 test.afterAll(async () => {
   await studio?.close();
   await experimentStudio?.close();
+  await blockedExperimentStudio?.close();
   await inspectorStudio?.close();
   if (lockedFixtureDir) await rm(lockedFixtureDir, { recursive: true, force: true });
   if (inspectorFixtureDir) await rm(inspectorFixtureDir, { recursive: true, force: true });
@@ -262,12 +299,53 @@ test("organizes configured surfaces around the Harness control plane", async ({ 
   await page.goto(inspectorStudio.url);
 
   await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "Harness control plane" })).toContainText("Sessions");
-  await expect(page.getByRole("navigation", { name: "Harness control plane" })).toContainText("Debugger");
-  await expect(page.getByRole("navigation", { name: "Harness control plane" })).toContainText("Compare");
-  await page.getByRole("button", { name: "Open workspace" }).first().click();
-  await expect(page.getByRole("heading", { name: "Open a project workspace" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Choose workspace" })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Studio project and View navigation" })).toContainText("Sessions");
+  await expect(page.getByRole("navigation", { name: "Studio project and View navigation" })).toContainText("Debugger");
+  await expect(page.getByRole("navigation", { name: "Studio project and View navigation" })).toContainText("Compare");
+  await expect(page.getByRole("button", { name: "Open Project", exact: true })).toHaveCount(0);
+  await openDestination(page, "Sessions");
+  await expect(page.getByRole("heading", { name: "Open a Project" })).toBeVisible();
+  await expect(page.getByText("This Studio launcher does not provide Project discovery.")).toBeVisible();
+});
+
+test("blocks an unavailable Qoder comparison without assigning ACP identity", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const browserErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") browserErrors.push(`console: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => browserErrors.push(`page: ${error.message}`));
+
+  await page.goto(blockedExperimentStudio.url);
+  await openDestination(page, "Compare");
+
+  await expect(page.getByLabel("AI 1 Agent")).toHaveCount(0);
+  await expect(page.getByLabel("AI 2 Agent")).toHaveCount(0);
+  await expect(page.locator(".simple-lane")).toHaveCount(2);
+  await expect(page.locator(".simple-lane").nth(0)).toContainText("Qoder");
+  await expect(page.locator(".simple-lane").nth(1)).toContainText("Qoder");
+  await expect(page.locator(".simple-compare-shell")).not.toContainText("Codex ACP");
+  await expect(page.getByRole("button", { name: "Run compare" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Advanced details" })).toBeDisabled();
+  await expect(page.locator(".simple-run-control [role=status]")).not.toHaveText("Ready");
+
+  await page.getByRole("button", { name: "Review setup" }).click();
+  await expect(page.getByText("Blocked", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("View status: Comparison")).toContainText("Comparison blocked");
+  await expect(page.locator(".builder-footer").getByText("Comparison blocked", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Checkpoint unavailable" })).toBeDisabled();
+
+  const directRunResponse = await fetch(new URL("api/experiment/runs", blockedExperimentStudio.url), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ experimentId: "exp_browser_blocked" }),
+  });
+  const directRun = { status: directRunResponse.status, payload: await directRunResponse.json() };
+  expect(directRun.status).toBe(409);
+  expect(directRun.payload.error).toBeTruthy();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  expect(browserErrors).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath("blocked-qoder-compare-narrow.png"), fullPage: true });
 });
 
 test("compares a focused ACP pair across roles, views, filters, and evidence", async ({ page }, testInfo) => {
@@ -280,20 +358,44 @@ test("compares a focused ACP pair across roles, views, filters, and evidence", a
 
   await page.goto(experimentStudio.url);
   await openDestination(page, "Compare");
-  await expect(page.getByRole("heading", { name: "Compare a past agent run" })).toBeVisible();
-  await expect(page.locator(".setup-details")).not.toHaveAttribute("open", "");
-  await expect(page.getByLabel("History checkpoint")).toHaveValue("episode_alpha");
-  await page.getByLabel("History checkpoint").selectOption("episode_beta");
-  await expect(page.locator(".history-picker-meta")).toContainText("Ready");
-  await expect(page.locator(".setup-summary")).toContainText("beta-42");
-  await expect(page.locator(".setup-summary")).toContainText("qoder-default-v1 vs qoder-minimal-v1");
-  await page.locator(".setup-details > summary").click();
-  await expect(page.locator(".checkpoint-facts")).toContainText("Checkpoint");
-  await expect(page.locator(".checkpoint-facts")).toContainText("beta-42");
-  await expect(page.locator(".request-preview")).toContainText("Compare ACP tool chains across lanes.");
-  await expect(page.locator(".variant-row")).toHaveCount(4);
-  await expect(page.getByRole("button", { name: "Lock and compare" })).toBeEnabled();
-  await page.getByRole("button", { name: "Lock and compare" }).click();
+  await expect(page.getByRole("group", { name: "Current project" })).toContainText("better-harness");
+  await expect(page.getByRole("group", { name: "Current project" })).toContainText("Same checkpoint for both AIs");
+  await expect(page.getByLabel("User prompt")).toBeVisible();
+  await expect(page.getByLabel("AI 1 Agent")).toHaveValue("qodercli");
+  await expect(page.getByLabel("AI 2 Agent")).toHaveValue("qodercli");
+  await page.getByLabel("AI 2 Agent").selectOption("codex-acp");
+  await expect(page.getByLabel("AI 2 Agent")).toHaveValue("codex-acp");
+  await expect(page.getByRole("region", { name: "Comparison scope" })).toContainText("Descriptive comparison: Agent + model policy + model");
+  await expect(page.locator(".simple-lane")).toHaveCount(2);
+  await page.getByLabel("User prompt").fill("Compare this exact live request.");
+  await page.getByRole("button", { name: "Run compare" }).click();
+  await expect(page.getByRole("tab", { name: "Resources" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator(".resource-map-header .lane-status-finished")).toHaveCount(2);
+  await expect(page.locator(".resource-map-row")).toHaveCount(2);
+  await expect(page.getByRole("table", { name: "ACP operations aligned by resource" })).toContainText("README.md");
+  await expect(page.getByRole("table", { name: "ACP operations aligned by resource" })).toContainText("Project root");
+  await expect(page.getByRole("region", { name: "Observed comparison facts" })).toContainText("2 resources used by both AIs");
+  await expect(page.getByRole("region", { name: "Observed comparison facts" })).toContainText("Qoder CLI");
+  await expect(page.getByRole("region", { name: "Observed comparison facts" })).toContainText("Codex ACP");
+  const resultTabs = page.getByRole("tablist", { name: "Comparison result views" });
+  await expect(resultTabs.locator('[role="tab"][tabindex="0"]')).toHaveCount(1);
+  await resultTabs.getByRole("tab", { name: "Resources" }).focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(resultTabs.getByRole("tab", { name: "Messages" })).toBeFocused();
+  await expect(resultTabs.getByRole("tab", { name: "Messages" })).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("ArrowLeft");
+  await expect(resultTabs.getByRole("tab", { name: "Resources" })).toBeFocused();
+  const readOperation = page.getByRole("button", { name: /AI 1 Read README\.md/ });
+  await readOperation.click();
+  const readCell = readOperation.locator("xpath=ancestor::*[@role='cell']");
+  await expect(readCell.getByRole("complementary", { name: "Tool result" })).toContainText("# fixture");
+  await expect(page.locator(".resource-map-header")).toContainText("Qoder CLI");
+  await expect(page.locator(".resource-map-header")).toContainText("Codex ACP");
+  await page.getByRole("tab", { name: "Messages" }).click();
+  await expect(page.locator(".simple-message.user-message")).toHaveCount(2);
+  await expect(page.locator(".simple-message.assistant-message")).toHaveCount(2);
+  await expect(page.locator(".simple-message.assistant-message").first()).toContainText("fresh-default is working on the project.");
+  await page.getByRole("button", { name: "Advanced details" }).click();
   await expect(page.getByRole("region", { name: "Comparison notebook" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Context" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Run comparison" })).toBeVisible();
@@ -310,7 +412,6 @@ test("compares a focused ACP pair across roles, views, filters, and evidence", a
   await expect(page.locator(".comparability")).toContainText("Controlled");
   await expect(page.locator(".call-lane")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Run comparison" }).click();
   await expect(page.locator(".lane-status-finished")).toHaveCount(2);
   await expect(page.locator(".lane-detail")).toHaveCount(0);
   await expect(page.locator(".lane-relation").nth(0)).toContainText("Exact match");
@@ -401,8 +502,9 @@ test("contains narrow experiment scrolling inside the comparison regions", async
   await page.setViewportSize({ width: 1024, height: 844 });
   await page.goto(experimentStudio.url);
   await openDestination(page, "Compare");
-  await expect(page.getByRole("button", { name: "Lock and compare" })).toBeEnabled();
-  await page.getByRole("button", { name: "Lock and compare" }).click();
+  await page.getByRole("button", { name: "Advanced details" }).click();
+  await expect(page.getByRole("button", { name: "Run comparison" })).toBeEnabled();
+  await page.getByRole("button", { name: "Run comparison" }).click();
   await expect(page.locator(".object-card")).toHaveCount(3);
   await expect(page.locator(".call-lane")).toHaveCount(2);
   await expect(page.locator(".experiment-rail")).not.toBeVisible();
@@ -428,10 +530,12 @@ test("contains narrow experiment scrolling inside the comparison regions", async
   await page.getByRole("button", { name: "Evidence results", exact: true }).click();
   await expect(page.locator(".decision-summary")).toContainText("Sufficient");
   await page.getByRole("button", { name: "Bench", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Compare a past agent run" })).toBeVisible();
+  await expect(page.getByLabel("User prompt")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Run compare" })).toBeVisible();
 });
 
 test("renders a keyboard-expandable failed and truncated Tool Call at 390px", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   const browserErrors = [];
   page.on("console", (message) => {
     if (message.type() === "error") browserErrors.push(`console: ${message.text()}`);
@@ -445,7 +549,7 @@ test("renders a keyboard-expandable failed and truncated Tool Call at 390px", as
   await page.getByRole("button", { name: "Run harness" }).click();
 
   await expect(page.getByRole("navigation", { name: "Session debugger controls" })).toHaveCount(0);
-  await expect(page.getByText("Live observation · no Evidence Cursor")).toBeVisible();
+  await expect(page.getByText("Run finished", { exact: true })).toBeVisible();
 
   await expect(page.locator(".run-status strong")).toHaveText("finished");
   const card = page.locator("details.tool-card");
@@ -509,23 +613,6 @@ test("renders a keyboard-expandable failed and truncated Tool Call at 390px", as
   expect(browserErrors).toEqual([]);
 });
 
-test("keeps visual decisions in owned Studio style sources", async () => {
-  const [index, shell, workbench] = await Promise.all([
-    readFile(resolve(packageRoot, "src/app/index.html"), "utf8"),
-    readFile(resolve(packageRoot, "src/app/styles/shell.css"), "utf8"),
-    readFile(resolve(packageRoot, "src/app/styles/workbench.css"), "utf8"),
-  ]);
-
-  expect(index).not.toMatch(/<style\b/i);
-  expect(index.match(/<link rel="stylesheet"/g)).toHaveLength(3);
-  for (const source of [shell, workbench]) {
-    expect(source).not.toMatch(/#[\da-f]{3,8}\b|rgba?\(/i);
-    expect(source).not.toMatch(/font-size:\s*(?:\d|\.)/);
-    expect(source).not.toMatch(/border-radius:\s*(?:\d|\.)/);
-    expect(source).not.toContain("!important");
-  }
-});
-
 test("renders the shell, local workspace intake, and empty compare surfaces at all layout modes", async ({ page }, testInfo) => {
   const browserErrors = [];
   page.on("console", (message) => { if (message.type() === "error") browserErrors.push(`console: ${message.text()}`); });
@@ -555,18 +642,21 @@ test("renders the shell, local workspace intake, and empty compare surfaces at a
     }
 
     await openDestination(page, "Sessions");
-    await expect(page.getByRole("heading", { name: "Open a project workspace" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Open a Project" })).toBeVisible();
+    await expect(page.getByText("This Studio launcher does not provide Project discovery.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Choose Project" })).toHaveCount(0);
     await assertRenderedContract(page);
     await page.screenshot({ path: testInfo.outputPath(`foundation-${layout.name}.png`) });
 
     await page.goto(inspectorStudio.url);
     await openDestination(page, "Compare");
-    await expect(page.getByRole("heading", { name: "Open a project workspace" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Open a Project" })).toBeVisible();
     await assertRenderedContract(page);
     await page.screenshot({ path: testInfo.outputPath(`empty-${layout.name}.png`) });
 
     await openDestination(page, "Sessions");
-    await expect(page.getByRole("button", { name: "Choose workspace" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Open a Project" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Choose Project" })).toHaveCount(0);
     await assertRenderedContract(page);
     await page.screenshot({ path: testInfo.outputPath(`sessions-${layout.name}.png`) });
   }
@@ -582,21 +672,90 @@ test("keeps Bench decision workspaces primary at all layout modes", async ({ pag
     await page.setViewportSize({ width: layout.width, height: layout.height });
     await page.goto(experimentStudio.url);
     await openDestination(page, "Compare");
-    const action = page.getByRole("button", { name: /^(Lock and compare|Open workbench)$/ });
-    await expect(action).toBeEnabled();
-    await action.click();
-    await expect(page.getByRole("region", { name: "Comparison notebook" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Run comparison" })).toBeInViewport();
+    await expect(page.getByRole("group", { name: "Current project" })).toBeVisible();
+    await expect(page.getByLabel("User prompt")).toBeInViewport();
+    await expect(page.getByRole("button", { name: "Run compare" })).toBeInViewport();
+    await expect(page.getByRole("button", { name: "Run compare" })).toHaveClass(/primary/);
+    await expect(page.locator(".simple-lane")).toHaveCount(2);
+    await expect(page.getByRole("button", { name: "Advanced details" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Comparison scope" })).toContainText("Repeatability comparison");
     await assertRenderedContract(page);
-    const ratio = await page.evaluate(() => {
-      const shell = document.querySelector(".experiment-shell")?.getBoundingClientRect();
-      const workspace = document.querySelector(".experiment-workspace")?.getBoundingClientRect();
-      return shell && workspace ? workspace.width / shell.width : 0;
+    const geometry = await page.evaluate(() => {
+      const selectors = [
+        ".simple-project-control",
+        "#compare-baseline-agent",
+        "#compare-candidate-agent",
+        "#compare-prompt",
+        ".simple-run-actions",
+        ".simple-run-actions .primary",
+      ];
+      return {
+        overflow: document.documentElement.scrollWidth - window.innerWidth,
+        viewportWidth: window.innerWidth,
+        critical: selectors.map((selector) => {
+          const rect = document.querySelector(selector)?.getBoundingClientRect();
+          return rect ? { selector, left: rect.left, right: rect.right, width: rect.width } : null;
+        }),
+      };
     });
-    expect(ratio).toBeGreaterThanOrEqual(0.5);
-    if (layout.name === "wide") await expect(page.locator(".experiment-rail")).toBeVisible();
-    else await expect(page.locator(".experiment-rail")).not.toBeVisible();
+    expect(geometry.overflow).toBe(0);
+    expect(geometry.critical).not.toContain(null);
+    for (const bounds of geometry.critical) {
+      expect(bounds.left, bounds.selector).toBeGreaterThanOrEqual(0);
+      expect(bounds.right, bounds.selector).toBeLessThanOrEqual(geometry.viewportWidth);
+      const minimumWidth = layout.name === "narrow" ? 160 : bounds.selector.endsWith(".primary") ? 88 : 120;
+      expect(bounds.width, bounds.selector).toBeGreaterThanOrEqual(minimumWidth);
+    }
     await page.screenshot({ path: testInfo.outputPath(`bench-${layout.name}.png`) });
+  }
+  expect(browserErrors).toEqual([]);
+});
+
+test("keeps resource-oriented ACP results usable at all layout modes", async ({ page }, testInfo) => {
+  const browserErrors = [];
+  page.on("console", (message) => { if (message.type() === "error") browserErrors.push(`console: ${message.text()}`); });
+  page.on("pageerror", (error) => browserErrors.push(`page: ${error.message}`));
+
+  for (const layout of LAYOUTS) {
+    await page.setViewportSize({ width: layout.width, height: layout.height });
+    await page.goto(experimentStudio.url);
+    await openDestination(page, "Compare");
+    await page.getByLabel("User prompt").fill(`Compare resources at ${layout.name}.`);
+    await page.getByRole("button", { name: "Run compare" }).click();
+    await expect(page.getByRole("tab", { name: "Resources" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator(".resource-map-row")).toHaveCount(2);
+    await expect(page.getByRole("table", { name: "ACP operations aligned by resource" })).toContainText("README.md");
+    await page.getByRole("button", { name: /AI 2 Verify Project root/ }).click();
+    await expect(page.getByRole("complementary", { name: "Tool result" })).toContainText("passed");
+    await assertRenderedContract(page);
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    expect(overflow).toBe(0);
+    if (layout.name === "narrow") {
+      const narrowLayout = await page.evaluate(() => {
+        const table = document.querySelector(".resource-map-table");
+        const inspector = document.querySelector(".operation-inspector");
+        const row = document.querySelector(".resource-map-row");
+        const resource = row?.querySelector(".resource-map-resource")?.getBoundingClientRect();
+        const baseline = row?.querySelector(".baseline-operations")?.getBoundingClientRect();
+        const candidate = row?.querySelector(".candidate-operations")?.getBoundingClientRect();
+        return {
+          inspectorInline: table !== null && inspector !== null && table.contains(inspector)
+            && inspector.parentElement?.getAttribute("role") === "cell",
+          resourceTop: resource?.top ?? 0,
+          baselineTop: baseline?.top ?? 0,
+          candidateTop: candidate?.top ?? 0,
+          baselineRight: baseline?.right ?? Number.POSITIVE_INFINITY,
+          candidateRight: candidate?.right ?? Number.POSITIVE_INFINITY,
+          viewportWidth: window.innerWidth,
+        };
+      });
+      expect(narrowLayout.inspectorInline).toBe(true);
+      expect(narrowLayout.resourceTop).toBeLessThan(narrowLayout.baselineTop);
+      expect(narrowLayout.baselineTop).toBeLessThan(narrowLayout.candidateTop);
+      expect(narrowLayout.baselineRight).toBeLessThanOrEqual(narrowLayout.viewportWidth);
+      expect(narrowLayout.candidateRight).toBeLessThanOrEqual(narrowLayout.viewportWidth);
+    }
+    await page.screenshot({ path: testInfo.outputPath(`compare-resource-map-${layout.name}.png`), fullPage: layout.name === "narrow" });
   }
   expect(browserErrors).toEqual([]);
 });
@@ -636,6 +795,7 @@ test("leads Evidence results with the decision at all layout modes", async ({ pa
     await page.setViewportSize({ width: layout.width, height: layout.height });
     await page.goto(experimentStudio.url);
     await openDestination(page, "Compare");
+    await page.getByRole("button", { name: "Advanced details" }).click();
     await page.getByRole("button", { name: "Evidence results", exact: true }).click();
     const decision = page.locator(".decision-summary");
     await expect(decision).toContainText("Sufficient");

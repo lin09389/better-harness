@@ -2,6 +2,7 @@ import { Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream } from "@agentclientprotocol/sdk";
 
 let cancelled = false;
+const sessionConfig = {};
 
 const app = agent({ name: "better-harness-acp-fixture" })
   .onRequest(methods.agent.initialize, (context) => ({
@@ -13,12 +14,46 @@ const app = agent({ name: "better-harness-acp-fixture" })
     if (process.argv.includes("--delay-new")) {
       await new Promise((resolve) => setTimeout(resolve, 10_000));
     }
-    return { sessionId: "fixture-session" };
+    return {
+      sessionId: "fixture-session",
+      configOptions: [{
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "fixture-default",
+        options: [
+          { value: "fixture-default", name: "Fixture default" },
+          { value: "fixture-candidate", name: "Fixture candidate" },
+        ],
+      }],
+    };
+  })
+  .onRequest(methods.agent.session.setConfigOption, (context) => {
+    const { configId, value } = context.params;
+    if (process.argv.includes("--reject-config")) {
+      return { configOptions: [] };
+    }
+    sessionConfig[configId] = value;
+    return {
+      configOptions: [{
+        id: configId,
+        name: configId,
+        type: typeof value === "boolean" ? "boolean" : "select",
+        currentValue: value,
+        ...(typeof value === "string"
+          ? { options: [{ value, name: value }] }
+          : {}),
+      }],
+    };
   })
   .onNotification(methods.agent.session.cancel, () => {
     cancelled = true;
   })
   .onRequest(methods.agent.session.prompt, async (context) => {
+    if (process.argv.includes("--artifact-internal-error")) {
+      process.stderr.write("fixture-secret-context\n");
+      throw new Error("fixture-internal-error");
+    }
     const sessionId = context.params.sessionId;
     const permission = await context.client.request(methods.client.session.requestPermission, {
       sessionId,
@@ -40,9 +75,18 @@ const app = agent({ name: "better-harness-acp-fixture" })
         sessionUpdate: "agent_message_chunk",
         content: {
           type: "text",
-          text: permission.outcome.outcome === "selected"
-            ? `fixture:${permission.outcome.optionId}`
-            : "fixture:cancelled",
+          text: process.argv.includes("--artifact-plan")
+            ? JSON.stringify({
+                kind: "HarnessStudioArtifactAgentPlanV1",
+                summary: "Rename the selected target through the bounded Provider contract.",
+                plan: ["Keep the exact semantic target.", "Ask the Provider to prepare one label change."],
+                providerSteering: { kind: "rename", message: "Rename to Agent planned" },
+              })
+            : process.argv.includes("--malformed-artifact-plan")
+              ? "The plan is ready."
+              : permission.outcome.outcome === "selected"
+                ? `fixture:${permission.outcome.optionId}${sessionConfig.model ? `:${sessionConfig.model}` : ""}`
+                : "fixture:cancelled",
         },
       },
     });

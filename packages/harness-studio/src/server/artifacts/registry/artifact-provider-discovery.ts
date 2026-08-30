@@ -115,6 +115,22 @@ function validateInjectedProvider(provider: ExternalArtifactProvider): string | 
         || contribution.surface.runtimeId !== contribution.surface.runtime.id)) {
       return `Artifact provider contribution '${contribution.id}' has inconsistent hosted surface identity.`;
     }
+    if (contribution.interaction !== undefined
+      && (contribution.interaction.id.trim() === ""
+        || contribution.interaction.version.trim() === ""
+        || contribution.interaction.protocolVersion !== "1")) {
+      return `Artifact provider contribution '${contribution.id}' has an unsupported interaction runtime.`;
+    }
+    if (contribution.intent !== undefined
+      && (contribution.surface.kind !== "external-hosted"
+        || typeof contribution.intent.id !== "string"
+        || contribution.intent.id.trim() === ""
+        || typeof contribution.intent.version !== "string"
+        || contribution.intent.version.trim() === ""
+        || contribution.intent.protocolVersion !== "1"
+        || typeof contribution.intent.admit !== "function")) {
+      return `Artifact provider contribution '${contribution.id}' has an unsupported hosted intent runtime.`;
+    }
   }
   return undefined;
 }
