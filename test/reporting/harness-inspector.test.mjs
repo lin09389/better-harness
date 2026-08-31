@@ -683,6 +683,14 @@ test("Inspector projects usage and context metadata without raw context text", (
       },
       runtime: { modelProvider: "openai", cliVersion: "fixture-cli", effort: "high", raw: secret },
       timestampBasis: "native-event",
+      usageReport: buildUsageReport([{
+        model: "fixture-model",
+        contextTokens: 25,
+        windowTokens: 100,
+        percentFull: 25,
+        outputTokens: 8,
+        timestamp: "2026-08-12T08:42:17.000Z",
+      }]),
       contextManifest: {
         status: "observed",
         source: "codex-rollout-token-count",
@@ -724,6 +732,10 @@ test("Inspector projects usage and context metadata without raw context text", (
     reusePercent: 50,
   });
   assert.deepEqual(session.runtime, { modelProvider: "openai", cliVersion: "fixture-cli", effort: "high" });
+  assert.deepEqual(session.usageSnapshot, {
+    status: "observed-through",
+    timestamp: "2026-08-12T08:42:17.000Z",
+  });
   assert.deepEqual(session.contextManifest, {
     status: "observed",
     source: "codex-rollout-token-count",
@@ -757,11 +769,15 @@ test("Inspector projects usage and context metadata without raw context text", (
   assert.match(html, /Usage and context/u);
   assert.match(html, /View report/u);
   assert.doesNotMatch(html, /<h3>Usage and Context Report<\/h3>/u);
-  assert.match(html, /<h3 class="visually-hidden">Usage report<\/h3>/u);
+  assert.match(html, /<div class="usage-report-heading"><h3>Usage report<\/h3>/u);
   assert.doesNotMatch(html, /<span class="usage-report-kicker">/u);
   assert.doesNotMatch(html, /<p>Unique model responses, absolute context progression/u);
   assert.match(html, /Input reuse/u);
   assert.match(html, /usage-report-reuse-tile/u);
+  assert.match(html, /Cached input still occupies context/u);
+  assert.match(html, /<details class="usage-report-evidence">/u);
+  assert.doesNotMatch(html, /Peak context/u);
+  assert.doesNotMatch(html, /usage-structure-bar/u);
   assert.doesNotMatch(html, /<h4>Current context composition<\/h4>/u);
   assert.match(html, /Total input \(includes cached\)/u);
   assert.match(html, /Raw context/u);
@@ -865,6 +881,24 @@ test("Inspector projects the derived Usage report instead of recounting the boun
   assert.equal(Object.hasOwn(report.sessions[0].usageReport, "netContextDeltaTokens"), false);
   assert.equal(Object.hasOwn(report.sessions[0].usageReport, "providerTotalTokens"), false);
   assert.equal(Object.hasOwn(report.sessions[0], "usageDiagnostics"), false);
+  assert.deepEqual(report.sessions[0].usageSnapshot, {
+    status: "generated-at",
+    timestamp: report.generatedAt,
+  });
+});
+
+test("Inspector keeps Usage snapshot freshness explicitly unavailable without valid timestamps", () => {
+  const report = buildHarnessInspectorReport({
+    repoRoot: "/workspace/repo",
+    featureTree: parseFeatureTreeMarkdown(FEATURE_TREE),
+    sessions: [fixtureSession({
+      usageReport: buildUsageReport([{ model: "fixture-model", contextTokens: 25 }]),
+    })],
+    correlation: fixtureCorrelation(),
+    generatedAt: "not-a-timestamp",
+  });
+
+  assert.deepEqual(report.sessions[0].usageSnapshot, { status: "unavailable" });
 });
 
 test("Inspector links Usage points to prompts only through observed Turn time windows (AC-30)", () => {
